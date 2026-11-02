@@ -1,0 +1,59 @@
+{
+  "years": [
+    2015,
+    2016,
+    2017,
+    2018,
+    2019
+  ],
+  "rows": 782,
+  "features": [
+    "gdp_per_capita",
+    "social_support",
+    "healthy_life_expectancy",
+    "freedom",
+    "generosity",
+    "corruption"
+  ],
+  "target": "happiness_score",
+  "identifiers": [
+    "country",
+    "year"
+  ],
+  "imputation": {
+    "year": 2018,
+    "column": "corruption",
+    "method": "median",
+    "scope": "observed values in 2018",
+    "value": 0.082,
+    "rows_imputed": 1,
+    "countries": [
+      "United Arab Emirates"
+    ]
+  },
+  "dropped_columns": [
+    "dystopia_residual",
+    "standard_error",
+    "lower_confidence_interval",
+    "upper_confidence_interval",
+    "whisker_low",
+    "whisker_high"
+  ],
+  "region_fill": {
+    "value": "Desconocido",
+    "rows_filled": 467
+  },
+  "missing_values": {
+    "country": 0,
+    "year": 0,
+    "region": 0,
+    "happiness_rank": 0,
+    "happiness_score": 0,
+    "gdp_per_capita": 0,
+    "social_support": 0,
+    "healthy_life_expectancy": 0,
+    "freedom": 0,
+    "corruption": 0,
+    "generosity": 0
+  }
+}
