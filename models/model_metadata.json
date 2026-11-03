@@ -1,0 +1,95 @@
+{
+  "selected_model": "RandomForest",
+  "selection_metric": "lowest mean temporal validation RMSE; MAE tie-break",
+  "features": [
+    "gdp_per_capita",
+    "social_support",
+    "healthy_life_expectancy",
+    "freedom",
+    "generosity",
+    "corruption"
+  ],
+  "target": "happiness_score",
+  "excluded_identifiers": [
+    "country",
+    "year"
+  ],
+  "validation_folds": [
+    {
+      "training_years": [
+        2015
+      ],
+      "validation_year": 2016,
+      "train_rows": 158,
+      "validation_rows": 157
+    },
+    {
+      "training_years": [
+        2015,
+        2016
+      ],
+      "validation_year": 2017,
+      "train_rows": 315,
+      "validation_rows": 155
+    },
+    {
+      "training_years": [
+        2015,
+        2016,
+        2017
+      ],
+      "validation_year": 2018,
+      "train_rows": 470,
+      "validation_rows": 156
+    }
+  ],
+  "evaluation_training_years": [
+    2015,
+    2016,
+    2017,
+    2018
+  ],
+  "test_year": 2019,
+  "test_rows": 156,
+  "selected_validation_metrics": {
+    "model": "RandomForest",
+    "cv_rmse": 0.5161285304921844,
+    "cv_rmse_std": 0.06111615353381838,
+    "cv_mae": 0.41336513817574927,
+    "cv_r2": 0.7881151964424106
+  },
+  "selected_test_metrics": {
+    "rmse": 0.6192931432283657,
+    "mae": 0.48328523352665886,
+    "r2": 0.6884687815809238
+  },
+  "baseline_test_metrics": {
+    "rmse": 1.1101007105822975,
+    "mae": 0.9163907594003441,
+    "r2": -0.000999341620546712
+  },
+  "best_parameters": {
+    "model__max_depth": null,
+    "model__min_samples_leaf": 2
+  },
+  "saved_model_training_years": [
+    2015,
+    2016,
+    2017,
+    2018,
+    2019
+  ],
+  "saved_model_training_rows": 782,
+  "saved_model_evaluation": "No independent holdout after final refit; reported test scores use 2015–2018 fit",
+  "data_sha256": "ace5f33503d2663d1a32e54ad05c52e9c3829a8101a1d0bf3b1a451c25ab4808",
+  "random_seed": 42,
+  "python_version": "3.13.2",
+  "package_versions": {
+    "scikit-learn": "1.9.1",
+    "xgboost": "3.4.1",
+    "lightgbm": "4.7.0",
+    "pandas": "2.3.3",
+    "numpy": "2.3.5",
+    "scipy": "1.16.3"
+  }
+}

@@ -1,0 +1,29 @@
+region,country,mean_score,years
+Sub-saharan africa,Burundi,3.0789999999999997,5
+Sub-saharan africa,Mali,4.218999999999999,5
+Sub-saharan africa,Mauritius,5.7066,5
+Southern asia,Afghanistan,3.5128,5
+Southern asia,Bangladesh,4.5802,5
+Southern asia,Pakistan,5.343999999999999,5
+Middle east and northern africa,Syria,3.2922,5
+Middle east and northern africa,Jordan,5.1796,5
+Middle east and northern africa,Israel,7.1422,5
+Southeastern asia,Cambodia,4.2054,5
+Southeastern asia,Indonesia,5.252,5
+Southeastern asia,Singapore,6.5428,5
+Central and eastern europe,Ukraine,4.3072,5
+Central and eastern europe,Turkmenistan,5.5822,5
+Central and eastern europe,Czech Republic,6.6546,5
+Eastern asia,Mongolia,5.0292,5
+Eastern asia,Hong Kong,5.4528,5
+Eastern asia,Taiwan,6.3972,5
+Latin america and caribbean,Haiti,3.8655999999999997,5
+Latin america and caribbean,El Salvador,6.1242,5
+Latin america and caribbean,Costa Rica,7.1262,5
+Western europe,Greece,5.1524,5
+Western europe,Germany,6.928999999999999,5
+Western europe,Denmark,7.545999999999999,5
+North america,United States,6.9988,5
+North america,Canada,7.3506,5
+Australia and new zealand,Australia,7.2762,5
+Australia and new zealand,New Zealand,7.313,5

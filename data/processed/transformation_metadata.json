@@ -39,9 +39,105 @@
     "whisker_low",
     "whisker_high"
   ],
+  "country_normalization": {
+    "aliases": {
+      "Taiwan Province of China": "Taiwan",
+      "Hong Kong S.A.R., China": "Hong Kong",
+      "Trinidad & Tobago": "Trinidad and Tobago",
+      "Northern Cyprus": "North Cyprus",
+      "Macedonia": "North Macedonia"
+    },
+    "changes": [
+      {
+        "year": 2015,
+        "original": "Macedonia",
+        "canonical": "North Macedonia",
+        "rows": 1
+      },
+      {
+        "year": 2016,
+        "original": "Macedonia",
+        "canonical": "North Macedonia",
+        "rows": 1
+      },
+      {
+        "year": 2017,
+        "original": "Taiwan Province of China",
+        "canonical": "Taiwan",
+        "rows": 1
+      },
+      {
+        "year": 2017,
+        "original": "Hong Kong S.A.R., China",
+        "canonical": "Hong Kong",
+        "rows": 1
+      },
+      {
+        "year": 2017,
+        "original": "Macedonia",
+        "canonical": "North Macedonia",
+        "rows": 1
+      },
+      {
+        "year": 2018,
+        "original": "Trinidad & Tobago",
+        "canonical": "Trinidad and Tobago",
+        "rows": 1
+      },
+      {
+        "year": 2018,
+        "original": "Northern Cyprus",
+        "canonical": "North Cyprus",
+        "rows": 1
+      },
+      {
+        "year": 2018,
+        "original": "Macedonia",
+        "canonical": "North Macedonia",
+        "rows": 1
+      },
+      {
+        "year": 2019,
+        "original": "Trinidad & Tobago",
+        "canonical": "Trinidad and Tobago",
+        "rows": 1
+      },
+      {
+        "year": 2019,
+        "original": "Northern Cyprus",
+        "canonical": "North Cyprus",
+        "rows": 1
+      }
+    ]
+  },
+  "numeric_rounding": {
+    "decimals": 3,
+    "columns": [
+      "gdp_per_capita",
+      "social_support",
+      "healthy_life_expectancy",
+      "freedom",
+      "generosity",
+      "corruption",
+      "happiness_score"
+    ]
+  },
   "region_fill": {
     "value": "Desconocido",
-    "rows_filled": 467
+    "rows_filled": 0,
+    "method": "normalized country mapping from observed regions, then explicit geographic overrides",
+    "rows_from_history": 466,
+    "rows_from_external_mapping": 1,
+    "external_mapping": {
+      "Gambia": "Sub-saharan africa"
+    },
+    "external_mapping_source": "https://unstats.un.org/unsd/methodology/m49/overview",
+    "source_years": [
+      2015,
+      2016
+    ],
+    "rows_imputed": 467,
+    "countries_without_region": []
   },
   "missing_values": {
     "country": 0,

@@ -1,7 +1,7 @@
 variable,auxiliary_r_squared,vif,diagnosis
-gdp_per_capita,0.658997098015589,2.932526363208824,Sin alerta elevada (<5)
-healthy_life_expectancy,0.6364345955095736,2.7505367332780213,Sin alerta elevada (<5)
-social_support,0.4513605982649018,1.8226908181174237,Sin alerta elevada (<5)
-freedom,0.3797605352173995,1.6122805090297003,Sin alerta elevada (<5)
-corruption,0.3050307886683764,1.4389126650429735,Sin alerta elevada (<5)
-generosity,0.16144102008232186,1.1925219620189036,Sin alerta elevada (<5)
+gdp_per_capita,0.6590520968710761,2.9329994137604842,Sin alerta elevada (<5)
+healthy_life_expectancy,0.6364914088567639,2.7509666191244495,Sin alerta elevada (<5)
+social_support,0.4513788031830196,1.822751300536423,Sin alerta elevada (<5)
+freedom,0.37980036325842637,1.6123840466173678,Sin alerta elevada (<5)
+corruption,0.3050663490687803,1.4389862955405708,Sin alerta elevada (<5)
+generosity,0.161413068724245,1.1924822134762878,Sin alerta elevada (<5)

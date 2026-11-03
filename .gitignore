@@ -1,1 +1,6 @@
 .env
+.venv/
+__pycache__/
+*.py[cod]
+data/streaming/*.db
+data/streaming/*.db-*
