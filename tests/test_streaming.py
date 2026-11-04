@@ -1,223 +1,246 @@
-"""Contrato, auditoría e inferencia: pruebas locales sin requerir Kafka activo."""
+"""Pruebas del productor y del consumidor, sin depender de un broker activo."""
 
 import json
-import math
-import pickle
-import sqlite3
+import os
+import uuid
+
+import psycopg
+from psycopg import sql
+from psycopg.conninfo import make_conninfo
+from psycopg.rows import dict_row
 import tempfile
 import unittest
-from contextlib import closing
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+from concurrent.futures import ThreadPoolExecutor
 
-import numpy as np
 import pandas as pd
 
-from kafka.config import DATA_PATH, EVENT_TO_MODEL, MODEL_PATH
-from kafka.contract import ContractError, decode_event, validate_event
-from kafka.inference import ModelPredictor
-from kafka.processing import process_message
-from kafka.producer import iter_events
-from kafka.storage import EventStore, IncomingMessage
+from kafka.consumer import DATABASE_URL, FEATURES, open_database, process_message, validate_event
+from kafka.producer import DATA_PATH, TOPIC, iter_events, publish_events
 
 
-def valid_event():
-    return {
-        "event_id": "E001", "country": "Colombia", "year": 2019,
-        "gdp": 1.2, "family": 0.8, "health": 0.9, "freedom": 0.6,
-        "generosity": 0.3, "corruption": 0.1, "actual_happiness_score": 6.2,
-        "event_time": "2026-10-30T15:30:00",
-    }
+@unittest.skipUnless(os.getenv("RUN_POSTGRES_TESTS") == "1", "Requiere PostgreSQL y RUN_POSTGRES_TESTS=1")
+class StreamingTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.schema = "test_streaming_" + uuid.uuid4().hex
+        cls.admin = psycopg.connect(DATABASE_URL, autocommit=True)
+        cls.admin.execute(sql.SQL("CREATE SCHEMA {}").format(sql.Identifier(cls.schema)))
+        cls.url = make_conninfo(DATABASE_URL, options=f"-csearch_path={cls.schema}")
+        cls.db = open_database(cls.url)
 
+    @classmethod
+    def tearDownClass(cls):
+        cls.db.close()
+        cls.admin.execute(sql.SQL("DROP SCHEMA {} CASCADE").format(sql.Identifier(cls.schema)))
+        cls.admin.close()
 
-class FixedPredictor:
-    name = "test"
-    sha256 = "unit-test"
+    def setUp(self):
+        self.directory = tempfile.TemporaryDirectory()
+        self.db.execute("TRUNCATE fact_predictions, raw_happiness_events, dim_date RESTART IDENTITY CASCADE")
+        self.event = next(iter_events())
+        self.model = Mock()
+        self.model.predict.return_value = [6.0]
+        self.info = {"name": "test", "sha256": "test"}
 
-    def __init__(self):
-        self.calls = 0
+    def tearDown(self):
+        self.directory.cleanup()
 
-    def predict(self, event):
-        self.calls += 1
-        return 6.0, {name: event[source] for source, name in EVENT_TO_MODEL.items()}
+    def message(self, event=None, offset=0, value=None):
+        message = Mock()
+        message.topic.return_value = TOPIC
+        message.partition.return_value = 0
+        message.offset.return_value = offset
+        message.key.return_value = self.event["country"].encode()
+        message.value.return_value = value if value is not None else json.dumps(event or self.event).encode()
+        message.timestamp.return_value = (1, 123)
+        message.headers.return_value = []
+        return message
 
-
-class ContractTests(unittest.TestCase):
-    def test_required_example_and_timezone(self):
-        for timestamp in ["2026-10-30T15:30:00", "2026-10-30T15:30:00Z", "2026-10-30T15:30:00.123-05:00"]:
-            event = {**valid_event(), "event_time": timestamp}
-            self.assertIs(validate_event(event, b"Colombia"), event)
-
-    def test_all_missing_fields(self):
-        for field in valid_event():
-            with self.subTest(field=field):
-                event = valid_event()
-                del event[field]
-                with self.assertRaises(ContractError) as context:
-                    validate_event(event, b"Colombia")
-                self.assertEqual(context.exception.status, "INVALID_SCHEMA")
-
-    def test_wrong_types(self):
-        cases = [("year", "2019"), ("year", 2019.0), ("year", True), ("gdp", True),
-                 ("family", None), ("health", "0.9"), ("event_id", 123),
-                 ("country", []), ("event_time", 123), ("actual_happiness_score", False)]
-        for field, value in cases:
-            with self.subTest(field=field, value=value):
-                with self.assertRaises(ContractError) as context:
-                    validate_event({**valid_event(), field: value}, b"Colombia")
-                self.assertEqual(context.exception.status, "INVALID_SCHEMA")
-
-    def test_invalid_values(self):
-        cases = [("year", 2020), ("gdp", -1), ("gdp", math.nan), ("family", math.inf),
-                 ("health", 1e100), ("gdp", 10**400), ("event_id", " "),
-                 ("country", ""), ("country", "\ud800"), ("event_id", "\ud800"),
-                 ("event_time", "2026-02-30T12:00:00"), ("event_time", "2026-10-30"),
-                 ("actual_happiness_score", 10.1), ("actual_happiness_score", -1)]
-        for field, value in cases:
-            with self.subTest(field=field, value=repr(value)):
-                with self.assertRaises(ContractError) as context:
-                    validate_event({**valid_event(), field: value}, b"Colombia")
-                self.assertEqual(context.exception.status, "INVALID_VALUES")
-
-    def test_bad_json_and_key(self):
-        for payload in [None, b"", b"\xff", b"{", b"[]", b"null", b'{"country":"A","country":"B"}',
-                        b'{"\\ud800":1,"\\ud800":2}']:
-            with self.subTest(payload=payload), self.assertRaises(ContractError):
-                decode_event(payload)
-        for key in [None, b"Argentina", b"colombia"]:
-            with self.subTest(key=key), self.assertRaises(ContractError):
-                validate_event(valid_event(), key)
-        for constant in [b"NaN", b"Infinity", b"-Infinity"]:
-            with self.assertRaises(ContractError) as context:
-                decode_event(b'{"gdp":' + constant + b'}')
-            self.assertEqual(context.exception.status, "INVALID_VALUES")
-
-    def test_extra_fields_rejected(self):
-        with self.assertRaises(ContractError):
-            validate_event({**valid_event(), "unexpected": 1}, b"Colombia")
-
-    def test_prepared_historical_data_and_unique_runs(self):
-        events = list(iter_events(DATA_PATH))
+    def test_all_prepared_events_satisfy_contract_and_have_unique_ids(self):
+        events = list(iter_events())
         self.assertEqual(len(events), 782)
         self.assertEqual(len({e["event_id"] for e in events}), 782)
         for event in events:
-            validate_event(event, event["country"].encode("utf-8"))
-        other = next(iter_events(DATA_PATH))
-        self.assertNotEqual(events[0]["event_id"], other["event_id"])
+            self.assertEqual(validate_event(event, event["country"].encode())[0], "VALID")
+        self.assertNotEqual(events[0]["event_id"], next(iter_events())["event_id"])
 
+    def test_missing_fields_types_and_values(self):
+        key = self.event["country"].encode()
+        for field in self.event:
+            event = self.event.copy()
+            del event[field]
+            self.assertEqual(validate_event(event, key)[0], "INVALID_SCHEMA")
+        for field, value, status in [
+            ("year", "2019", "INVALID_SCHEMA"), ("year", True, "INVALID_SCHEMA"),
+            ("gdp", None, "INVALID_SCHEMA"), ("family", "0.8", "INVALID_SCHEMA"),
+            ("country", " ", "INVALID_VALUES"), ("gdp", -1, "INVALID_VALUES"),
+            ("health", float("inf"), "INVALID_VALUES"), ("gdp", float("nan"), "INVALID_VALUES"),
+            ("event_time", "2026-02-30T10:00:00", "INVALID_VALUES"),
+        ]:
+            self.assertEqual(validate_event({**self.event, field: value}, key)[0], status)
+        self.assertEqual(validate_event(self.event, b"wrong-country")[0], "INVALID_VALUES")
 
-class PersistenceTests(unittest.TestCase):
-    def setUp(self):
-        self.directory = tempfile.TemporaryDirectory()
-        self.path = Path(self.directory.name) / "test.db"
-        self.store = EventStore(self.path)
-        self.predictor = FixedPredictor()
+    def test_raw_is_committed_before_decoding(self):
+        original_loads = json.loads
+        message = self.message(value=b'  {"missing": true}  ')
 
-    def tearDown(self):
-        self.store.close()
-        self.directory.cleanup()
+        def check_persistence(value):
+            with psycopg.connect(self.url, autocommit=True, row_factory=dict_row) as other:
+                row = other.execute("SELECT raw_value, processing_status FROM raw_happiness_events").fetchone()
+            self.assertEqual((row["raw_value"], row["processing_status"]), (message.value(), "RECEIVED"))
+            return original_loads(value)
 
-    def message(self, event=None, offset=0, payload=None):
-        value = payload if payload is not None else json.dumps(event or valid_event(), indent=2).encode()
-        return IncomingMessage("happiness-events", 0, offset, b"Colombia", value,
-                               (("x", b"\x00\xff"), ("x", None)), 1, 123)
+        with patch("kafka.consumer.json.loads", side_effect=check_persistence):
+            self.assertEqual(process_message(self.db, self.model, message, self.info), "INVALID_SCHEMA")
+        self.model.predict.assert_not_called()
 
-    def raw(self, offset=0):
-        return self.store.connection.execute("SELECT * FROM raw_happiness_events WHERE offset_id=?", (offset,)).fetchone()
+    def test_prediction_uses_only_six_ordered_features(self):
+        self.assertEqual(process_message(self.db, self.model, self.message(), self.info), "VALID")
+        frame = self.model.predict.call_args.args[0]
+        self.assertEqual(frame.columns.tolist(), list(FEATURES.values()))
+        self.assertNotIn("actual_happiness_score", frame.columns)
+        row = self.db.execute("SELECT * FROM fact_predictions").fetchone()
+        self.assertEqual(row["predicted_score"], 6.0)
+        self.assertAlmostEqual(row["prediction_error"], self.event["actual_happiness_score"] - 6.0)
 
-    def test_original_bytes_committed_before_json_validation(self):
-        message = self.message(payload=b' \n{ "invalid": true }  ')
-        original_decode = decode_event
+    def test_missing_model_feature_is_identified(self):
+        event = self.event.copy()
+        del event["health"]
+        status, reason = validate_event(event, event["country"].encode())
+        self.assertEqual(status, "INVALID_SCHEMA")
+        self.assertIn("health", reason)
 
-        def check_durable(payload):
-            with closing(sqlite3.connect(self.path)) as external:
-                row = external.execute("SELECT raw_value, raw_key, processing_status FROM raw_happiness_events").fetchone()
-            self.assertEqual(row, (message.value, message.key, "RECEIVED"))
-            return original_decode(payload)
+    def test_invalid_records_are_preserved_and_never_predicted(self):
+        missing = self.event.copy()
+        del missing["family"]
+        cases = [
+            (json.dumps(missing).encode(), "INVALID_SCHEMA"),
+            (json.dumps({**self.event, "gdp": "1.2"}).encode(), "INVALID_SCHEMA"),
+            (json.dumps({**self.event, "gdp": -1}).encode(), "INVALID_VALUES"),
+            (json.dumps({**self.event, "health": float("nan")}).encode(), "INVALID_VALUES"),
+            (b"\\xff", "INVALID_SCHEMA"),
+            (None, "INVALID_SCHEMA"),
+        ]
+        for offset, (payload, expected) in enumerate(cases):
+            with self.subTest(offset=offset):
+                message = self.message(offset=offset)
+                message.value.return_value = payload
+                self.assertEqual(process_message(self.db, self.model, message, self.info), expected)
+                raw = self.db.execute("SELECT raw_value, processing_status FROM raw_happiness_events WHERE offset_id=%s",
+                                      (offset,)).fetchone()
+                self.assertEqual((raw["raw_value"], raw["processing_status"]), (payload, expected))
+        self.model.predict.assert_not_called()
+        self.assertEqual(self.db.execute("SELECT COUNT(*) AS n FROM fact_predictions").fetchone()["n"], 0)
 
-        with patch("kafka.processing.decode_event", side_effect=check_durable):
-            self.assertEqual(process_message(self.store, self.predictor, message), "INVALID_SCHEMA")
-        self.assertEqual(self.predictor.calls, 0)
-        self.assertEqual(self.raw()["raw_value"], message.value)
+    def test_invalid_and_prediction_error_allow_next_event(self):
+        self.assertEqual(process_message(self.db, self.model, self.message(value=b"not-json"), self.info), "INVALID_SCHEMA")
+        self.model.predict.side_effect = RuntimeError("failed")
+        self.assertEqual(process_message(self.db, self.model, self.message(offset=1), self.info), "PREDICTION_ERROR")
+        self.model.predict.side_effect = None
+        event = {**self.event, "event_id": "next-event"}
+        self.assertEqual(process_message(self.db, self.model, self.message(event, 2), self.info), "VALID")
 
-    def test_valid_prediction_and_input_excludes_target(self):
-        self.assertEqual(process_message(self.store, self.predictor, self.message()), "VALID")
-        row = self.store.connection.execute("SELECT * FROM happiness_predictions").fetchone()
-        self.assertAlmostEqual(row["residual"], .2)
-        features = json.loads(row["input_features_json"])
-        self.assertEqual(list(features), list(EVENT_TO_MODEL.values()))
-        self.assertNotIn("actual_happiness_score", features)
-        self.assertNotIn("country", features)
-        self.assertEqual(json.loads(self.raw()["headers_json"]), [["x", "AP8="], ["x", None]])
-
-    def test_redelivery_is_idempotent(self):
+    def test_redelivery_and_duplicate_identifiers(self):
         message = self.message()
-        process_message(self.store, self.predictor, message)
-        process_message(self.store, self.predictor, message)
-        self.assertEqual(self.predictor.calls, 1)
-        self.assertEqual(self.store.connection.execute("SELECT COUNT(*) FROM happiness_predictions").fetchone()[0], 1)
-        self.assertEqual(self.store.connection.execute("SELECT COUNT(*) FROM raw_happiness_events").fetchone()[0], 1)
+        process_message(self.db, self.model, message, self.info)
+        process_message(self.db, self.model, message, self.info)
+        self.model.predict.assert_called_once()
+        self.assertEqual(process_message(self.db, self.model, self.message(offset=1), self.info), "INVALID_VALUES")
+        self.assertEqual(self.db.execute("SELECT COUNT(*) AS n FROM fact_predictions").fetchone()["n"], 1)
 
-    def test_duplicate_event_id_at_other_offset_is_audited(self):
-        process_message(self.store, self.predictor, self.message())
-        self.assertEqual(process_message(self.store, self.predictor, self.message(offset=1)), "INVALID_VALUES")
-        self.assertEqual(self.predictor.calls, 1)
-        self.assertIn("duplicado", self.raw(1)["error_message"])
+    def test_fact_dates_country_and_traceability(self):
+        event = {**self.event, "year": 2019, "event_time": "2026-10-30T23:30:00-05:00"}
+        message = self.message(event)
+        self.assertEqual(process_message(self.db, self.model, message, self.info), "VALID")
+        row = self.db.execute("SELECT * FROM v_prediction_detail").fetchone()
+        self.assertEqual(row["observation_year"], 2019)
+        self.assertEqual(row["date_id"], 20261031)
+        self.assertEqual(row["country_name"], self.event["country"])
+        self.assertEqual(row["region"], "Western europe")
+        raw = self.db.execute("SELECT raw_value FROM raw_happiness_events WHERE raw_event_id=%s",
+                              (row["raw_event_id"],)).fetchone()
+        self.assertEqual(raw["raw_value"], message.value())
+        self.assertIsNotNone(row["prediction_timestamp"].tzinfo)
+        date = self.db.execute("SELECT * FROM dim_date").fetchone()
+        self.assertEqual((date["year"], date["month"], date["day"], date["quarter"]), (2026, 10, 31, 4))
 
-    def test_resume_after_raw_commit_without_processing(self):
-        message = self.message()
-        self.store.save_raw(message)
-        self.store.close()
-        self.store = EventStore(self.path)
-        self.assertEqual(process_message(self.store, self.predictor, message), "VALID")
+    def test_analytical_kpis(self):
+        self.model.predict.return_value = [7.0]
+        for offset, actual in enumerate([6.0, 8.0]):
+            event = {**self.event, "event_id": f"metrics-{offset}", "actual_happiness_score": actual}
+            process_message(self.db, self.model, self.message(event, offset), self.info)
+        metrics = self.db.execute("SELECT * FROM v_prediction_metrics").fetchone()
+        self.assertEqual((metrics["mae"], metrics["rmse"], metrics["r2"]), (1.0, 1.0, 0.0))
+        self.assertEqual((metrics["mean_actual_score"], metrics["mean_predicted_score"]), (7.0, 7.0))
+        self.assertEqual(metrics["error_over_05_pct"], 100)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) AS n FROM v_prediction_metrics").fetchone()["n"], 3)
+        self.assertEqual(self.db.execute("SELECT * FROM v_country_error_ranking").fetchone()["error_rank"], 1)
+        self.assertEqual(self.db.execute("SELECT * FROM v_prediction_activity_daily").fetchone()["predictions"], 2)
+        quality = self.db.execute("SELECT * FROM v_event_quality_daily").fetchone()
+        self.assertEqual((quality["received_events"], quality["predicted_events"]), (2, 2))
 
-    def test_invalid_and_prediction_error_do_not_stop_next_records(self):
-        for offset, payload, expected in [(0, b'broken', "INVALID_SCHEMA"),
-                                          (1, json.dumps({**valid_event(), "gdp": -1}).encode(), "INVALID_VALUES")]:
-            self.assertEqual(process_message(self.store, self.predictor, self.message(offset=offset, payload=payload)), expected)
-        with patch.object(self.predictor, "predict", side_effect=RuntimeError("model failed")):
-            self.assertEqual(process_message(self.store, self.predictor, self.message(offset=2)), "PREDICTION_ERROR")
-        event = {**valid_event(), "event_id": "E002"}
-        self.assertEqual(process_message(self.store, self.predictor, self.message(event=event, offset=3)), "VALID")
+    def test_raw_bytes_cannot_be_modified(self):
+        process_message(self.db, self.model, self.message(), self.info)
+        with self.assertRaises(psycopg.errors.RaiseException):
+            self.db.execute("UPDATE raw_happiness_events SET raw_value=%s", (b"changed",))
+        self.assertEqual(self.db.execute("SELECT COUNT(*) AS n FROM fact_predictions").fetchone()["n"], 1)
 
-    def test_tombstone_and_invalid_utf8_stored_exactly(self):
-        for offset, value in enumerate([None, b"\xff\x00"]):
-            message = IncomingMessage("happiness-events", 1, offset, None, value)
-            self.assertEqual(process_message(self.store, self.predictor, message), "INVALID_SCHEMA")
-            self.assertEqual(self.raw(offset)["raw_value"], value)
+    def test_concurrent_duplicate_has_only_one_fact(self):
+        def process(offset):
+            with psycopg.connect(self.url, autocommit=True, row_factory=dict_row) as db:
+                return process_message(db, self.model, self.message(offset=offset), self.info)
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            statuses = list(pool.map(process, [0, 1]))
+        self.assertEqual(sorted(statuses), ["INVALID_VALUES", "VALID"])
+        self.assertEqual(self.db.execute("SELECT COUNT(*) AS n FROM fact_predictions").fetchone()["n"], 1)
 
-    def test_database_write_failure_is_not_swallowed(self):
-        with patch.object(self.store, "save_prediction", side_effect=sqlite3.OperationalError("disk full")):
-            with self.assertRaises(sqlite3.OperationalError):
-                process_message(self.store, self.predictor, self.message())
-        self.assertEqual(self.raw()["processing_status"], "RECEIVED")
-        self.assertEqual(self.store.connection.execute("SELECT COUNT(*) FROM event_claims").fetchone()[0], 0)
-        self.assertEqual(process_message(self.store, self.predictor, self.message()), "VALID")
+    def test_failed_fact_transaction_preserves_raw_for_retry(self):
+        self.db.execute("""CREATE FUNCTION fail_fact() RETURNS TRIGGER LANGUAGE plpgsql AS $$
+            BEGIN RAISE EXCEPTION 'simulated database failure'; END; $$;
+            CREATE TRIGGER fail_fact BEFORE INSERT ON fact_predictions
+            FOR EACH ROW EXECUTE FUNCTION fail_fact();""", prepare=False)
+        try:
+            with self.assertRaises(psycopg.errors.RaiseException):
+                process_message(self.db, self.model, self.message(), self.info)
+            raw = self.db.execute("SELECT * FROM raw_happiness_events").fetchone()
+            self.assertEqual(raw["processing_status"], "RECEIVED")
+            self.assertEqual(self.db.execute("SELECT COUNT(*) AS n FROM fact_predictions").fetchone()["n"], 0)
+            self.assertEqual(self.db.execute("SELECT COUNT(*) AS n FROM dim_date").fetchone()["n"], 0)
+        finally:
+            self.db.execute("DROP TRIGGER fail_fact ON fact_predictions; DROP FUNCTION fail_fact();", prepare=False)
+        self.assertEqual(process_message(self.db, self.model, self.message(), self.info), "VALID")
 
-    def test_raw_is_immutable(self):
-        self.store.save_raw(self.message())
-        with self.assertRaises(sqlite3.IntegrityError):
-            with self.store.connection:
-                self.store.connection.execute("UPDATE raw_happiness_events SET raw_value=?", (b"modified",))
+    def test_producer_sends_json_country_key_delay_and_topic_topology(self):
+        path = Path(self.directory.name) / "sample.csv"
+        pd.read_csv(DATA_PATH).head(2).to_csv(path, index=False)
+        admin = Mock()
+        admin.create_topics.return_value = {TOPIC: Mock()}
+        topic = SimpleNamespace(error=None, partitions={i: SimpleNamespace(replicas=[1]) for i in range(3)})
+        admin.list_topics.side_effect = [SimpleNamespace(topics={}), SimpleNamespace(topics={TOPIC: topic})]
+        producer = Mock()
+        producer.flush.return_value = 0
+        with patch("kafka.producer.AdminClient", return_value=admin), patch("kafka.producer.Producer", return_value=producer), patch("kafka.producer.time.sleep") as sleep:
+            self.assertEqual(publish_events(.25, path), 2)
+        created = admin.create_topics.call_args.args[0][0]
+        self.assertEqual((created.topic, created.num_partitions, created.replication_factor), (TOPIC, 3, 1))
+        for call in producer.produce.call_args_list:
+            event = json.loads(call.kwargs["value"])
+            self.assertEqual(call.args[0], TOPIC)
+            self.assertEqual(call.kwargs["key"], event["country"].encode())
+        self.assertEqual(sleep.call_args_list[0].args, (.25,))
 
-    def test_invalid_unicode_json_key_is_auditable(self):
-        message = self.message(payload=b'{"\\ud800":1,"\\ud800":2}')
-        self.assertEqual(process_message(self.store, self.predictor, message), "INVALID_SCHEMA")
-        self.assertIsNotNone(self.raw()["error_message"])
-
-
-class SavedModelTests(unittest.TestCase):
-    def test_streaming_mapping_matches_training_and_ignores_actual(self):
-        predictor = ModelPredictor()
-        events = list(iter_events(DATA_PATH))[:5]
-        with MODEL_PATH.open("rb") as file:
+    def test_event_mapping_matches_saved_model(self):
+        import pickle
+        from kafka.producer import ROOT
+        with (ROOT / "models/model.pkl").open("rb") as file:
             model = pickle.load(file)
-        data = pd.read_csv(DATA_PATH)
-        expected = model.predict(data[list(EVENT_TO_MODEL.values())].head(5))
-        observed = [predictor.predict(event)[0] for event in events]
-        np.testing.assert_allclose(observed, expected, rtol=1e-12, atol=1e-12)
-        self.assertAlmostEqual(predictor.predict(events[0])[0],
-                               predictor.predict({**events[0], "actual_happiness_score": 0})[0], places=12)
+        inputs = {column: self.event[field] for field, column in FEATURES.items()}
+        expected = model.predict(pd.read_csv(DATA_PATH)[list(FEATURES.values())].head(1))[0]
+        actual = model.predict(pd.DataFrame([inputs], columns=list(FEATURES.values())))[0]
+        self.assertAlmostEqual(actual, expected, places=12)
 
 
 if __name__ == "__main__":

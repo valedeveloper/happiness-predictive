@@ -8,7 +8,7 @@ El puntaje representa evaluaciones de vida en una escala de 0 a 10, obtenidas me
 
 La unidad analítica es el **registro país–edición**, identificado por `country` y `year`. En los notebooks se denomina país–año; `year` identifica el archivo o edición y no garantiza que todas las mediciones originales se hayan recogido exclusivamente en ese año. Se conserva la denominación operativa «país» para las unidades geográficas del dataset, que también incluye territorios.
 
-El alcance actual comprende preparación, análisis, entrenamiento por lotes y simulación de Streaming ETL con Apache Kafka e inferencia en Python. La arquitectura final permanece reservada para su documentación por el autor; la implementación local de la Parte B se describe en la sección 14.
+El alcance actual comprende preparación, análisis, entrenamiento por lotes y simulación de Streaming ETL con Apache Kafka e inferencia en Python. La arquitectura general se presenta en la sección 2; las partes B y C documentan el flujo de eventos y el almacén de predicciones.
 
 ## 2. Arquitectura del sistema
 
@@ -46,6 +46,8 @@ Se dispone de **782 registros**. Tras normalizar nombres se identifican **165 pa
 | `corruption` | Predictor numérico | Indicador asociado a percepción de corrupción y confianza institucional. |
 
 Los campos numéricos se interpretan como **indicadores publicados en los archivos**. Pueden representar contribuciones estimadas por el informe; no deben leerse automáticamente como dólares, años de vida o proporciones de población. La homogeneización de nombres no demuestra equivalencia metodológica completa entre ediciones. Una asociación positiva de `corruption` con el objetivo no significa que una mayor corrupción produzca mayor felicidad.
+
+##  Parte A — Procesamiento Offline
 
 ## 4. Perfilado de datos y decisiones de transformación
 
@@ -382,30 +384,223 @@ predictions = model.predict(examples[features].head())
 print(predictions)
 ```
 
-# Colocar acá lo de kafka
+## 11. Parte B — Streaming ETL with Apache Kafka
 
+Esta etapa transforma el histórico preparado en un flujo simulado y ejecuta inferencia al recibir cada evento. La implementación se concentra en [producer.py](kafka/producer.py) y [consumer.py](kafka/consumer.py); Kafka transporta los mensajes y PostgreSQL conserva el original y el resultado.
 
-
-## 11. Reproducción y artefactos
-
-Instalar [requirements.txt](requirements.txt) en el entorno virtual y seleccionar ese intérprete como kernel de los notebooks. Desde PowerShell, con el entorno virtual creado:
-
-```powershell
-.venv\Scripts\python.exe -m pip install -r requirements.txt
+```mermaid
+flowchart LR
+    CSV["Histórico preparado<br/>782 registros país–año"] --> P["Python producer<br/>JSON + clave country + demora"]
+    P --> K["happiness-events<br/>3 particiones · replicación 1"]
+    K --> C["Python consumer<br/>grupo happiness-ml-team"]
+    C --> R["Persistir original<br/>raw_happiness_events"]
+    R --> V{"Validar contrato"}
+    V -->|Inválido| X["Registrar estado y motivo<br/>Sin hecho de predicción"]
+    V -->|Válido| M["Seis predictores ordenados<br/>Pipeline model.pkl"]
+    M --> F["Cargar dimensiones y hecho<br/>PostgreSQL"]
+    M -->|Error de inferencia| X
+    X --> O["Confirmar offset<br/>después del commit de la base"]
+    F --> O
 ```
 
-Ejecutar las celdas en orden, siguiendo esta secuencia:
+### 11.1. Step 5 — Kafka Producer
 
-| Orden | Notebook | Producto principal |
+| Requisito del ejercicio | Implementación realizada | Evidencia en el código |
 | --- | --- | --- |
-| 1 | [data-profiling.ipynb](notebooks/data-profiling.ipynb) | Diagnóstico de originales e informes HTML; generación de informes opcional y configurable. |
-| 2 | [transform-data.ipynb](notebooks/transform-data.ipynb) | CSV analítico, CSV de modelado y metadatos de transformación. |
-| 3 | [exploratory-data-analysis.ipynb](notebooks/exploratory-data-analysis.ipynb) | Figuras y tablas de distribuciones, regiones, evolución y asociaciones. |
-| 4 | [models-happiness.ipynb](notebooks/models-happiness.ipynb) | Ajuste, comparación, diagnósticos y persistencia del modelo. |
+| Leer el histórico registro por registro. | Se recorre `happiness_modeling.csv` con `csv.DictReader`, sin cargar el archivo completo en memoria. | `iter_events()` en `producer.py`. |
+| Publicar eventos individualmente. | Cada fila produce un evento; se espera la confirmación antes de continuar. | `produce()` y `flush()` dentro del ciclo. |
+| Serializar como JSON. | Se construyen los campos del contrato, se serializan mediante `json.dumps` y se codifican en UTF-8. | `allow_nan=False` impide publicar NaN o Infinity. |
+| Usar el país como clave Kafka. | `country` se envía como clave UTF-8 para mantener los eventos del mismo país en la misma partición. | `key=event["country"].encode("utf-8")`. |
+| Simular llegada de eventos en el tiempo. | Se introduce una pausa entre publicaciones, configurable en segundos. | `--delay` y `time.sleep(delay)`; valor inicial de 0,1 segundos. |
+| Tópico obligatorio `happiness-events`. | Se utiliza el mismo nombre en productor, consumidor y configuración del broker. | Constante `TOPIC` y `docker-compose.yml`. |
+| Tres particiones y replicación uno. | Se crea el tópico con esta topología y se comprueba que un tópico existente la respete. | `NewTopic(..., num_partitions=3, replication_factor=1)`. |
+| Identificación y momento de emisión. | Se genera un identificador único por ejecución y secuencia, junto con la hora UTC de emisión. | `event_id` y `event_time` en cada registro. |
 
-Los notebooks localizan la raíz a partir de los archivos de entrada. Las figuras se guardan en `dashboards/screenshots/eda/` y `dashboards/screenshots/models/`; las tablas, en `data/reports/eda/` y `data/reports/models/`. Las versiones exactas del entrenamiento se registran en `models/model_metadata.json`.
+Kafka garantiza el orden dentro de una partición; no se establece un orden global entre las tres particiones. Una nueva ejecución del productor representa otra simulación y genera identificadores nuevos.
 
-## 12. Limitaciones y alcance
+### 11.2. Event Contract — Campos y correspondencia con el modelo
+
+| Campo del evento | Tipo y validación | Uso posterior |
+| --- | --- | --- |
+| `event_id` | String no vacío, con Unicode válido y sin carácter nulo. Se comprueba que no haya sido aceptado previamente. | Trazabilidad y control de duplicados. |
+| `country` | String no vacío; debe coincidir exactamente con la clave Kafka en UTF-8. | Resolver `dim_country`; no ingresa al modelo. |
+| `year` | Entero de la observación histórica, entre 2015 y 2019. No se aceptan booleanos ni números escritos como texto. | `observation_year`; no ingresa al modelo. |
+| `gdp` | Número finito, no negativo y compatible con el modelo. | Predictor 1: `gdp_per_capita`. |
+| `family` | Misma validación numérica. | Predictor 2: `social_support`. |
+| `health` | Misma validación numérica. | Predictor 3: `healthy_life_expectancy`. |
+| `freedom` | Misma validación numérica. | Predictor 4: `freedom`. |
+| `generosity` | Misma validación numérica. | Predictor 5: `generosity`. |
+| `corruption` | Misma validación numérica. | Predictor 6: `corruption`. |
+| `actual_happiness_score` | Número finito entre 0 y 10. | Se almacena como valor real para calcular el error; **se excluye de la matriz de entrada**. |
+| `event_time` | Fecha y hora ISO-8601 válida; el productor emite UTC. | Fecha de emisión y análisis temporal del flujo. |
+
+Los campos son obligatorios. El consumidor rechaza valores numéricos ausentes, null, booleanos, texto numérico, NaN, Infinity o magnitudes incompatibles con float32. Los indicadores no se limitan a [0,1], porque el histórico contiene valores superiores a uno. La validación de negocio corresponde a la aplicación, no al broker Kafka.
+
+### 11.3. Step 6 — Kafka Consumer
+
+| Requisito del ejercicio | Implementación realizada | Resultado verificable |
+| --- | --- | --- |
+| Usar `happiness-ml-team`. | El consumidor se suscribe a `happiness-events` con ese grupo. | Posiciones y lag identificables por grupo y partición. |
+| Recibir eventos continuamente. | Se consulta Kafka mediante `poll()` hasta detener el proceso. | Una ejecución de procesamiento por mensaje recibido. |
+| Guardar el original antes de transformar o predecir. | Se insertan valor y clave originales como `BYTEA` y se confirma la transacción antes de interpretar JSON. | Fila raw durable, incluso si después falla el contrato o la inferencia. |
+| Validar el contrato y las características necesarias. | Se comprueban JSON, campos obligatorios, tipos, rangos, finitud, timestamp y correspondencia de la clave. | Estado y motivo identifican el rechazo; se nombran los campos faltantes. |
+| Aplicar el mismo orden y preprocesamiento. | Se construyen exactamente las seis columnas y se verifica su orden contra `feature_names_in_`. | Se invoca el pipeline guardado; no se ajusta un nuevo preprocesador. |
+| Cargar el modelo y predecir. | Se carga `models/model.pkl` una vez al iniciar y se llama a `predict()` para cada evento válido. | Puntaje predicho finito asociado a la versión del artefacto. |
+| Almacenar predicciones y errores. | Se cargan dimensiones y `fact_predictions`, relacionadas con el original mediante `raw_event_id`. | Resultado reconstruible desde el mensaje que lo originó. |
+| Conservar inválidos y continuar. | Los rechazos se registran sin llamar al modelo; los fallos de inferencia también se auditan. | El siguiente mensaje puede procesarse normalmente. |
+| Confirmar después de persistir. | El commit del offset Kafka ocurre después del commit en PostgreSQL. | Una reentrega no genera otro hecho para el mismo original. |
+
+| Estado raw | Interpretación | ¿Genera fila en `fact_predictions`? |
+| --- | --- | --- |
+| `RECEIVED` | Original guardado; procesamiento pendiente. | No todavía. |
+| `VALID` | Contrato aceptado, predicción y carga terminadas. | Sí, una. |
+| `INVALID_SCHEMA` | JSON, estructura, campos o tipos incorrectos. | No. |
+| `INVALID_VALUES` | Valores, fecha o clave inválidos, o identificador duplicado. | No. |
+| `PREDICTION_ERROR` | Evento aceptado por el contrato, pero la inferencia falla. | No. |
+
+Un error propio del registro no interrumpe el flujo. Si PostgreSQL no puede guardar una transacción, el consumidor se detiene sin confirmar ese offset para evitar la pérdida silenciosa del mensaje. La [guía operativa](kafka/README.md) complementa esta síntesis.
+
+## 12. Parte C — Almacén de datos y análisis de predicciones
+
+El almacén en PostgreSQL organiza los resultados mediante una tabla raw/staging y un modelo estrella. El diseño y las vistas se implementan en [sql/streaming.sql](sql/streaming.sql); el consumidor realiza la carga sin distribuir la lógica entre módulos adicionales.
+
+### 12.1. Cinco requerimientos analíticos y KPI
+
+| ID | Pregunta que debe responder el análisis | Desagregación y criterio | KPI y fuente |
+| --- | --- | --- | --- |
+| R1 | ¿Cuántos mensajes se recibieron, cuántos terminaron con predicción y por qué se rechazaron los demás? | Por día UTC de recepción y estado final; distinguir pendientes, rechazos del contrato y errores de inferencia. | Conteos, porcentaje con predicción y porcentaje de rechazo: `v_event_quality_daily`. |
+| R2 | ¿Cuánto difiere el puntaje predicho del real para cada país y región en cada edición histórica? | Comparar la misma población de eventos, año histórico y versión del modelo. | Media real, media predicha y error medio con signo: `v_prediction_metrics`. |
+| R3 | ¿Qué precisión presenta el modelo en cada edición y agrupación geográfica? | Calcular desde errores individuales para país–año, región–año y total anual; separar versiones. | MAE, RMSE y R²: `v_prediction_metrics`. R² queda nulo si no hay al menos dos valores reales con variación. |
+| R4 | ¿Cuántas predicciones se generan por día y cuánto transcurre desde emitir un evento hasta predecirlo? | Agrupar por día UTC de emisión y versión; incluir la espera en Kafka en la demora total. | Predicciones diarias y demora media en milisegundos: `v_prediction_activity_daily`. |
+| R5 | ¿Qué países presentan los errores más elevados y qué proporción supera medio punto? | Ordenar países por MAE dentro del mismo año histórico y versión; conservar empates en el ranking. | Ranking, máximo error absoluto y porcentaje con error absoluto **> 0,5**: `v_country_error_ranking`. |
+
+### Granularidad
+
+**Cada fila en `fact_predictions` corresponde a una predicción generada para un evento válido de un país y año histórico, con la versión del modelo utilizada.**
+
+`raw_event_id` vincula el hecho con su original y es único en la tabla de hechos. Una reentrega del mismo mensaje no produce otra fila; una nueva simulación tiene identificadores nuevos. Por tanto, país y año histórico no constituyen una clave única del hecho.
+
+### 12.2. Modelo dimensional
+
+```mermaid
+erDiagram
+    direction LR
+    raw_happiness_events ||--o| fact_predictions : "origina y permite auditar"
+    dim_country ||--o{ fact_predictions : "clasifica por pais y region"
+    dim_date ||--o{ fact_predictions : "clasifica la emision UTC"
+
+    raw_happiness_events {
+        bigint raw_event_id PK
+        text topic "UK compuesta con particion y offset"
+        integer partition_id
+        bigint offset_id
+        bytea raw_key "Original; admite NULL"
+        bytea raw_value "Original exacto; admite NULL"
+        text headers_json "Headers ordenados; valores base64"
+        smallint kafka_timestamp_type
+        bigint kafka_timestamp_ms
+        timestamptz received_at
+        text event_id "Unico entre VALID y PREDICTION_ERROR"
+        text processing_status
+        text error_message
+        timestamptz processed_at
+    }
+    dim_country {
+        integer country_id PK
+        text country_name UK
+        text region
+    }
+    dim_date {
+        integer date_id PK "AAAAMMDD UTC"
+        date calendar_date UK
+        smallint day "Generado desde calendar_date"
+        smallint month "Generado desde calendar_date"
+        smallint quarter "Generado desde calendar_date"
+        smallint year "Anio calendario; no historico"
+    }
+    fact_predictions {
+        bigint prediction_id PK
+        bigint raw_event_id FK, UK
+        integer country_id FK
+        integer date_id FK
+        smallint observation_year "Edicion historica 2015 a 2019"
+        float8 actual_score
+        float8 predicted_score
+        float8 prediction_error "Generado: real menos predicho"
+        timestamptz event_time
+        timestamptz prediction_timestamp
+        text model_name
+        text model_sha256
+    }
+```
+
+### 12.3. Load Raw Events and Prediction Results
+
+El consumidor debe completar las siguientes operaciones en este orden. La tabla raw conserva todos los mensajes; solo los válidos que producen una predicción ingresan al hecho.
+
+| Paso | Operación de carga | Destino y regla | Condición de finalización |
+| --- | --- | --- | --- |
+| 1 | Guardar bytes originales, clave, tópico, partición, offset y metadatos de recepción. | Insertar en `raw_happiness_events` con estado `RECEIVED`; la posición Kafka es única. | **Confirmar esta transacción antes de deserializar JSON.** |
+| 2 | Interpretar el evento y validar el contrato. | Si falla, conservar el original, registrar estado y motivo, y omitir inferencia y carga del hecho. | Rechazo durable; continuar con el siguiente mensaje después de confirmar el offset. |
+| 3 | Controlar reentregas e identificadores repetidos. | Si la posición ya tiene estado final, no repetirla. Si otro mensaje aceptado utilizó `event_id`, marcar `INVALID_VALUES`. | Como máximo un hecho por original. |
+| 4 | Preparar las seis entradas y ejecutar `model.pkl`. | Respetar el orden entrenado y excluir el puntaje real. Si falla, registrar `PREDICTION_ERROR`. | Predicción numérica finita o error de inferencia persistido. |
+| 5 | Resolver `country_id`. | Buscar el país normalizado en `dim_country`. El catálogo inicial contiene 165 países y sus regiones; un país nuevo válido se incorpora con región `Desconocido`. | Clave de país válida, sin inventar una región. |
+| 6 | Resolver `date_id` a partir de la emisión. | Convertir `event_time` a UTC e insertar el día en `dim_date` si no existe. Conservar `year` como `observation_year`. | Fecha de emisión y año histórico claramente separados. |
+| 7 | Insertar la predicción y su trazabilidad. | Guardar referencias raw/país/fecha, año histórico, puntaje real, predicho, `event_time`, `prediction_timestamp` y versión del modelo. PostgreSQL almacena `prediction_error = actual_score − predicted_score`. | Una fila completa en `fact_predictions`, vinculada al original. |
+| 8 | Finalizar la carga y confirmar Kafka. | Dimensiones, hecho y estado `VALID` se confirman juntos. Después se confirma el offset Kafka. | Un fallo de carga revierte esa transacción; el original permanece `RECEIVED` para reintento. |
+
+El instante histórico y el operativo tienen funciones distintas: un registro de **2019** puede emitirse en **2026**. No se inventa un día o mes para la edición histórica. `TIMESTAMPTZ` conserva los instantes y `dim_date` agrupa el día de emisión UTC; una hora entrante sin zona se interpreta como UTC según la convención del ejercicio. Un trigger impide modificar los campos originales del staging.
+
+La carga inicial fue contrastada con Kafka y con el modelo guardado; la evidencia está en [verification.json](data/reports/streaming/verification.json). Sus conteos describen esa ejecución y no son valores fijos del sistema: nuevas simulaciones agregan eventos.
+
+## 13. Dashboard and KPIs
+
+Esta sección queda preparada para incorporar las capturas del dashboard y su interpretación. Cada evidencia debe indicar año histórico o fecha operativa, versión del modelo y filtros utilizados.
+
+| Panel | KPI que debe responder | Visualización prevista | Fuente |
+| --- | --- | --- | --- |
+| R1 — Calidad del flujo | Recibidos, pendientes, predichos, rechazos por causa y fallos de inferencia; porcentajes de predicción y rechazo. | Tarjetas de conteo y barras por estado. | `v_event_quality_daily`. |
+| R2 — Real frente a predicho | Media real, media predicha y error medio por país o región y edición. | Barras agrupadas y dispersión observado–predicho. | `v_prediction_metrics` y `v_prediction_detail`. |
+| R3 — Precisión | MAE, RMSE y R² del nivel geográfico y año seleccionados. | Tarjetas y comparación por región o edición. | `v_prediction_metrics`. |
+| R4 — Actividad temporal | Predicciones por día de emisión y demora media emisión–predicción. | Serie temporal de volumen y demora. | `v_prediction_activity_daily`. |
+| R5 — Mayores errores | Países con mayor MAE, máximo error absoluto y porcentaje por encima de 0,5 puntos. | Ranking horizontal y tabla de detalle. | `v_country_error_ranking`. |
+
+### 13.1. R1 — Calidad del flujo
+
+> **Espacio reservado:** capturas de conteos, distribución de estados, porcentaje con predicción y porcentaje de rechazo. Añadir interpretación y período consultado.
+
+### 13.2. R2 — Comparación real–predicho
+
+> **Espacio reservado:** capturas de medias reales y predichas, diferencia media y dispersión. Añadir país o región, año histórico y versión seleccionada.
+
+### 13.3. R3 — Precisión del modelo
+
+> **Espacio reservado:** capturas de MAE, RMSE y R². Indicar nivel de agregación y explicar cualquier R² nulo.
+
+### 13.4. R4 — Actividad y demora del streaming
+
+> **Espacio reservado:** capturas del volumen diario y demora media de emisión a predicción. Identificar si se incluyen mensajes recuperados del histórico.
+
+### 13.5. R5 — Países con mayores errores
+
+> **Espacio reservado:** capturas del ranking por MAE, máximo error absoluto y porcentaje superior a 0,5 puntos. Añadir año histórico y versión.
+
+### 13.6. Criterios de interpretación de los KPI
+
+| Indicador o consulta | Regla de cálculo e interpretación |
+| --- | --- |
+| Porcentaje con predicción | `100 × válidos / recibidos`; incluye los pendientes en el denominador. |
+| Porcentaje de rechazo | `100 × (INVALID_SCHEMA + INVALID_VALUES) / finalizados`; excluye `RECEIVED` y muestra `PREDICTION_ERROR` por separado. |
+| Error con signo | `actual_score − predicted_score`: positivo indica subestimación y negativo, sobreestimación. |
+| MAE y RMSE | Se calculan desde los errores individuales. No se promedian RMSE de países para obtener un RMSE regional. |
+| R² | Requiere al menos dos observaciones y variación del valor real. No equivale a porcentaje de predicciones correctas ni se promedia entre subgrupos. |
+| Nivel geográfico de la vista | En `v_prediction_metrics`, país informado = país; país nulo y región informada = región; ambos nulos = total anual. Filtrar un solo nivel para evitar doble conteo. |
+| Edición histórica frente a fecha del flujo | `observation_year` se utiliza para el histórico; `calendar_date` identifica el día UTC de emisión y `received_date`, el día UTC de recepción. |
+| Repetición de simulaciones | Los KPI operativos cuentan eventos. Para describir el histórico, seleccionar una observación por país–año y versión dentro de la ventana elegida, evitando sobreponderar países republicados. |
+| Demora emisión–predicción | Incluye permanencia en Kafka y procesamiento. Los mensajes recuperados después de varias horas no representan exclusivamente tiempo de cómputo del modelo. |
+| Alcance predictivo | El flujo reutiliza datos incluidos en el reentrenamiento; estas métricas no sustituyen la evaluación temporal independiente de la Parte A. |
+
+## 14. Limitaciones y alcance
 
 - **Comparabilidad entre ediciones:** nombres comunes no garantizan idéntica construcción o escala de indicadores. El experimento usa campos publicados y no datos brutos individuales de encuestas.
 - **Cobertura y dependencia:** el conjunto histórico no es un panel completamente balanceado; los mismos países aparecen varias veces. Los resultados no se extrapolan automáticamente a individuos, países nuevos o toda la población mundial.
@@ -413,9 +608,177 @@ Los notebooks localizan la raíz a partir de los archivos de entrada. Las figura
 - **Selección y evaluación:** la rejilla es acotada y solo se dispone de tres ventanas de validación y una edición de prueba. No se establecen diferencias estadísticamente significativas entre modelos.
 - **Disponibilidad de entradas:** se requieren indicadores de la edición objetivo; no se pronostican indicadores futuros.
 - **Interpretación:** correlaciones e importancias no identifican causalidad. La región se completó con histórico y una asignación externa; no es predictor del modelo.
-- **Artefacto final:** el reentrenamiento 2015–2019 requiere datos posteriores e independientes para una nueva evaluación. La simulación Kafka utiliza ese mismo histórico y no constituye una prueba independiente adicional. La arquitectura final del sistema permanece pendiente de documentación.
+- **Artefacto final:** el reentrenamiento 2015–2019 requiere datos posteriores e independientes para una nueva evaluación. La simulación Kafka utiliza ese mismo histórico y no constituye una prueba independiente adicional.
 
-## 13. Fuentes y documentación técnica
+## 15. Estructura del proyecto
+
+```text
+workshop-3/
+├── README.md                         # Metodología, resultados y ejecución
+├── docker-compose.yml                # Kafka; PostgreSQL Docker opcional
+├── requirements.txt                  # Dependencias Python
+├── data/
+│   ├── raw/                          # CSV originales 2015–2019
+│   ├── processed/                    # Datasets preparados y metadatos
+│   └── reports/
+│       ├── profile_2015.html …        # Informes de calidad por edición
+│       ├── eda/                      # Tablas del análisis exploratorio
+│       ├── models/                   # Búsquedas, métricas y predicciones 2019
+│       └── streaming/verification.json
+├── notebooks/
+│   ├── data-profiling.ipynb
+│   ├── transform-data.ipynb
+│   ├── exploratory-data-analysis.ipynb
+│   └── models-happiness.ipynb
+├── models/
+│   ├── model.pkl                     # Pipeline final reentrenado
+│   └── model_metadata.json            # Esquema, versión y trazabilidad
+├── kafka/
+│   ├── producer.py                   # Lectura, contrato de salida y publicación
+│   ├── consumer.py                   # Validación, inferencia y carga PostgreSQL
+│   └── README.md                     # Guía operativa complementaria
+├── sql/
+│   └── streaming.sql                 # Staging, dimensiones, hecho y vistas
+├── dashboards/
+│   ├── diagrams/                     # Arquitectura y flujo de entrenamiento
+│   └── screenshots/                  # Figuras EDA/modelos; futuras capturas KPI
+└── tests/
+    └── test_streaming.py              # Contrato, persistencia y KPI PostgreSQL
+```
+
+## 16. Execution instructions
+
+### 16.1. Preparar el entorno Python
+
+Desde la raíz del repositorio, crear el entorno si aún no existe e instalar las dependencias. Los comandos siguientes utilizan **PowerShell 7**:
+
+```powershell
+python -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+
+Seleccionar ese intérprete como kernel de los notebooks. El artefacto serializado debe utilizarse con versiones compatibles con las registradas en [model_metadata.json](models/model_metadata.json).
+
+### 16.2. Preparar PostgreSQL local
+
+La conexión principal utiliza estos parámetros:
+
+| Parámetro | Valor |
+| --- | --- |
+| Host | `localhost` |
+| Puerto | `5432` |
+| Usuario | `postgres` |
+| Base del proyecto | `happiness_dw` |
+| Contraseña | La contraseña configurada en tu instalación local; no se incluye en el repositorio. |
+
+Iniciar el servicio PostgreSQL y, **solo si la base todavía no existe**, crearla desde pgAdmin o `psql`, conectado a la base administrativa `postgres`:
+
+```sql
+CREATE DATABASE happiness_dw OWNER postgres;
+```
+
+El consumidor crea automáticamente tablas y vistas dentro de `happiness_dw` y carga el catálogo de países al iniciar. No crea el servidor ni la base administrativa. Para proporcionar la contraseña en la terminal que ejecutará el consumidor:
+
+```powershell
+$env:PGPASSWORD = Read-Host 'Contraseña de postgres' -MaskInput
+```
+
+La conexión predeterminada es `postgresql://postgres@localhost:5432/happiness_dw`. `DATABASE_URL` o `--database-url` permiten seleccionar otra base o usuario; las variables estándar de PostgreSQL, como `PGPASSWORD`, proporcionan la autenticación. Si la URI contiene una contraseña, sus caracteres reservados deben codificarse para una URL.
+
+El servicio PostgreSQL de Docker queda bajo el perfil opcional `database`; **`docker compose up -d` inicia el flujo Kafka y utiliza tu PostgreSQL local para el consumidor**. No es necesario activar ese perfil cuando la instalación local ya utiliza el puerto 5432. El volumen anterior de demostración se conserva; cambiar la configuración de conexión no copia automáticamente sus datos a la instalación local.
+
+### 16.3. Reproducir la Parte A
+
+Ejecutar las celdas en orden dentro de cada notebook:
+
+| Orden | Notebook | Producto principal |
+| --- | --- | --- |
+| 1 | [data-profiling.ipynb](notebooks/data-profiling.ipynb) | Diagnóstico e informes de los originales. La generación HTML es opcional y configurable. |
+| 2 | [transform-data.ipynb](notebooks/transform-data.ipynb) | CSV analítico, CSV de modelado y metadatos de transformación. |
+| 3 | [exploratory-data-analysis.ipynb](notebooks/exploratory-data-analysis.ipynb) | Figuras y tablas de distribuciones, regiones, evolución y asociaciones. |
+| 4 | [models-happiness.ipynb](notebooks/models-happiness.ipynb) | Comparación de modelos, diagnósticos, `model.pkl` y metadatos. |
+
+Los notebooks localizan la raíz a partir de sus archivos de entrada. Las tablas se exportan a `data/reports/eda/` y `data/reports/models/`; las figuras, a `dashboards/screenshots/eda/` y `dashboards/screenshots/models/`.
+
+### 16.4. Ejecutar las partes B y C
+
+Con Docker Desktop activo, iniciar Kafka y comprobar el tópico:
+
+```powershell
+docker compose up -d
+docker compose ps -a
+docker compose logs kafka-init
+```
+
+El broker debe estar `healthy`; los inicializadores deben terminar con código 0. `kafka-init` debe mostrar `happiness-events` con tres particiones y replicación uno.
+
+**Terminal 1 — consumidor**, con PostgreSQL y `happiness_dw` disponibles:
+
+```powershell
+$env:PGPASSWORD = Read-Host 'Contraseña de postgres' -MaskInput
+.venv\Scripts\python.exe kafka/consumer.py
+```
+
+**Terminal 2 — productor**:
+
+```powershell
+.venv\Scripts\python.exe kafka/producer.py --delay 0.1
+```
+
+Se publican los 782 registros del histórico preparado. `--delay` modifica los segundos entre publicaciones; `--data` permite señalar otro CSV con el mismo esquema. El consumidor espera continuamente y se detiene con `Ctrl+C`.
+
+El grupo retoma sus offsets confirmados. Cambiar de base no hace que Kafka reenvíe automáticamente eventos ya confirmados: una nueva publicación crea una simulación nueva; la recuperación deliberada de eventos anteriores requiere un procedimiento de replay y validación de offsets.
+
+### 16.5. Consultar resultados y ejecutar pruebas
+
+Desde pgAdmin o `psql` conectado a **`happiness_dw`**:
+
+```sql
+-- Calidad del flujo y causas de rechazo.
+SELECT * FROM v_event_quality_daily ORDER BY received_date;
+
+-- Trazabilidad de las últimas predicciones.
+SELECT event_id, country_name, observation_year, calendar_date,
+       actual_score, predicted_score, prediction_error
+FROM v_prediction_detail
+ORDER BY prediction_id DESC LIMIT 10;
+
+-- Métricas regionales: no mezclar este nivel con países o totales.
+SELECT region, observation_year, mae, rmse, r2
+FROM v_prediction_metrics
+WHERE country_name IS NULL AND region IS NOT NULL
+ORDER BY observation_year, region;
+```
+
+Para usar el cliente instalado con PostgreSQL 18, si `psql` no está en el PATH:
+
+```powershell
+& 'C:\Program Files\PostgreSQL\18\bin\psql.exe' -h localhost -p 5432 -U postgres -d happiness_dw
+```
+
+Las pruebas requieren autenticación configurada y utilizan un esquema temporal aislado, que se elimina al terminar. No vacían las tablas del almacén:
+
+```powershell
+$env:PGPASSWORD = Read-Host 'Contraseña de postgres' -MaskInput
+$env:RUN_POSTGRES_TESTS = '1'
+.venv\Scripts\python.exe -m unittest discover -s tests -v
+Remove-Item Env:RUN_POSTGRES_TESTS
+```
+
+La [evidencia de verificación](data/reports/streaming/verification.json) describe la ejecución comprobada en el entorno anterior de demostración. No certifica por sí sola la conexión ni la carga de tu instalación local: eso se comprueba ejecutando los comandos anteriores con tus credenciales.
+
+### 16.6. Detener el flujo
+
+Detener los procesos Python con `Ctrl+C` y después ejecutar:
+
+```powershell
+docker compose down
+Remove-Item Env:PGPASSWORD -ErrorAction SilentlyContinue
+```
+
+El volumen Kafka y los datos de PostgreSQL se conservan. El servicio PostgreSQL instalado localmente se administra de forma independiente de Docker Compose.
+
+## 17. Fuentes y documentación técnica
 
 - [World Happiness Report: metodología](https://www.worldhappiness.report/faq/).
 - [World Happiness Report en Kaggle: archivos históricos](https://www.kaggle.com/datasets/unsdsn/world-happiness).
@@ -423,23 +786,8 @@ Los notebooks localizan la raíz a partir de los archivos de entrada. Las figura
 - [scikit-learn: métricas de evaluación](https://scikit-learn.org/stable/modules/model_evaluation.html).
 - [XGBoost: API de Python](https://xgboost.readthedocs.io/en/stable/python/python_api.html).
 - [LightGBM: LGBMRegressor](https://lightgbm.readthedocs.io/en/stable/pythonapi/lightgbm.LGBMRegressor.html).
-
-## 14. Parte B — Streaming ETL con Apache Kafka
-
-El histórico preparado se publica fila a fila como JSON en **`happiness-events`**, utilizando `country` como clave. Docker Compose configura un broker Apache Kafka en KRaft, con **tres particiones y factor de replicación uno**. El productor permite regular la llegada mediante `--delay`.
-
-El consumidor pertenece al grupo **`happiness-ml-team`**. Antes de deserializar o validar cada mensaje, guarda sus bytes originales y metadatos Kafka en **`raw_happiness_events`**, dentro de `data/streaming/happiness.db` (SQLite). Después valida el contrato, reconstruye las seis columnas en el orden de entrenamiento, utiliza el pipeline de `models/model.pkl` y persiste las predicciones en **`happiness_predictions`**. El puntaje real se almacena para comparación y no es una entrada del modelo.
-
-Los inválidos permanecen auditados como `INVALID_SCHEMA`, `INVALID_VALUES` o `PREDICTION_ERROR`, con su motivo, sin detener el flujo por errores de registro. El offset solo se confirma después de persistir el resultado. Las restricciones por posición Kafka e identificador de evento impiden repetir predicciones por redelivery.
-
-| Componente | Implementación |
-| --- | --- |
-| Entorno local y tópico | [docker-compose.yml](docker-compose.yml) |
-| Contrato y validación de negocio | [event.schema.json](kafka/event.schema.json) y [contract.py](kafka/contract.py) |
-| Productor Python | [producer.py](kafka/producer.py) |
-| Consumidor Python | [consumer.py](kafka/consumer.py) |
-| Esquema de auditoría y predicciones | [streaming.sql](sql/streaming.sql) |
-| Pruebas locales e integración | [tests](tests/) |
-| Evidencia de la verificación con Kafka real | [verification.json](data/reports/streaming/verification.json) |
-
-La [guía de la Parte B](kafka/README.md) documenta arquitectura local, reglas del contrato, mapeo de columnas, estados, semántica de recuperación y comandos de ejecución y consulta. La simulación se realiza con datos incluidos en el reentrenamiento del artefacto final; sus errores no deben presentarse como desempeño fuera de muestra.
+- [Apache Kafka: imagen oficial y configuración Docker](https://hub.docker.com/r/apache/kafka).
+- [Confluent: cliente Python para Kafka y offsets](https://docs.confluent.io/kafka-clients/python/current/index.html).
+- [PostgreSQL: almacenamiento binario del original](https://www.postgresql.org/docs/current/datatype-binary.html).
+- [PostgreSQL: fechas, horas y zonas horarias](https://www.postgresql.org/docs/current/datatype-datetime.html).
+- [Psycopg: transacciones con PostgreSQL](https://www.psycopg.org/psycopg3/docs/basic/transactions.html).

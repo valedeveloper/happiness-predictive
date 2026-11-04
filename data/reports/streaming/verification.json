@@ -1,22 +1,28 @@
 {
-  "verified_at": "2026-11-03T15:55:38.929+00:00",
+  "verified_at": "2026-11-04T03:28:51.559857+00:00",
+  "database": "PostgreSQL",
   "topic": "happiness-events",
   "partitions": 3,
   "replication_factor": 1,
   "consumer_group": "happiness-ml-team",
-  "historical_events": 782,
-  "probe_events": 9,
-  "raw_events": 791,
+  "replayed_kafka_messages": 791,
+  "tables": {
+    "raw_happiness_events": 793,
+    "dim_country": 165,
+    "dim_date": 2,
+    "fact_predictions": 785
+  },
   "statuses": {
     "INVALID_SCHEMA": 4,
     "INVALID_VALUES": 4,
-    "VALID": 783
+    "VALID": 785
   },
-  "predictions": 783,
   "raw_bytes_preserved": true,
   "model_predictions_match_batch": true,
-  "one_partition_per_country": true,
-  "messages_after_restart_without_new_events": 0,
+  "raw_to_fact_link_verified": true,
+  "unit_and_database_tests_passed": 15,
   "model_sha256": "da1133604f057754849a2c8228c74b50dd51e2e6e0750dd9bc1f85d4909b6383",
-  "note": "Simulación histórica con model.pkl reentrenado en 2015–2019; no es evaluación independiente."
+  "note": "Recuperación de los mensajes originales desde Kafka. Predicciones sobre histórico utilizado en el reentrenamiento; no es evaluación independiente.",
+  "live_events_verified": 2,
+  "production_consumer_loop_verified": true
 }

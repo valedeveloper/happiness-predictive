@@ -1,95 +1,90 @@
-"""Publica cada fila histórica como un evento JSON con clave country."""
+"""Paso 5: publicar el histórico preparado como eventos de Kafka."""
 
 import argparse
 import csv
 import json
-import logging
 import math
 import time
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 
 from confluent_kafka import Producer
+from confluent_kafka.admin import AdminClient, NewTopic
 
-from .config import BOOTSTRAP_SERVERS, DATA_PATH, EVENT_TO_MODEL, TOPIC
-from .contract import validate_event
-from .storage import utc_now
-from .topic import ensure_topic
-
-LOGGER = logging.getLogger(__name__)
+ROOT = Path(__file__).resolve().parents[1]
+DATA_PATH = ROOT / "data/processed/happiness_modeling.csv"
+BROKER = "127.0.0.1:9092"
+TOPIC = "happiness-events"  # Requisito: nombre obligatorio del tópico.
 
 
-def iter_events(data_path, run_id=None):
-    run_id = run_id or uuid.uuid4().hex
+def iter_events(data_path=DATA_PATH):
+    # Contrato: UUID por ejecución + secuencia = event_id único y no vacío.
+    run_id = uuid.uuid4().hex
     with Path(data_path).open(encoding="utf-8-sig", newline="") as file:
-        reader = csv.DictReader(file)
-        required = {"country", "year", "happiness_score", *EVENT_TO_MODEL.values()}
-        if not required.issubset(reader.fieldnames or []):
-            raise ValueError(f"El CSV no contiene las columnas de entrenamiento: {sorted(required)}")
-        for number, row in enumerate(reader, 1):
-            # Lectura fila a fila; el productor no necesita cargar todo el CSV.
+        # Requisito: leer el histórico registro por registro, sin cargarlo completo.
+        for number, row in enumerate(csv.DictReader(file), start=1):
+            if not row["country"].strip():
+                raise ValueError("country no puede estar vacío.")
+            # Requisito: JSON con los nombres solicitados y tipos del contrato.
             yield {
-                "event_id": f"E{run_id}-{number:06d}",
-                "country": row["country"],
-                "year": int(row["year"]),
-                **{source: float(row[name]) for source, name in EVENT_TO_MODEL.items()},
+                "event_id": f"E{run_id}-{number:03d}",
+                "country": row["country"],  # Contrato: string no vacío y clave Kafka.
+                "year": int(row["year"]),  # Contrato: edición histórica como entero.
+                # Contrato: seis valores numéricos del esquema unificado de entrenamiento.
+                "gdp": float(row["gdp_per_capita"]),
+                "family": float(row["social_support"]),
+                "health": float(row["healthy_life_expectancy"]),
+                "freedom": float(row["freedom"]),
+                "generosity": float(row["generosity"]),
+                "corruption": float(row["corruption"]),
+                # Contrato: valor real para evaluación; NO es un predictor del modelo.
                 "actual_happiness_score": float(row["happiness_score"]),
-                "event_time": utc_now(),
+                # Contrato: hora de emisión del evento en formato ISO-8601 (UTC).
+                "event_time": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             }
 
 
-def publish_events(bootstrap_servers, data_path=DATA_PATH, delay=0.1, limit=None):
+def publish_events(delay=0.1, data_path=DATA_PATH):
     if not math.isfinite(delay) or delay < 0:
-        raise ValueError("delay debe ser finito y no negativo.")
-    if limit is not None and limit < 1:
-        raise ValueError("limit debe ser positivo.")
-    ensure_topic(bootstrap_servers)
-    producer = Producer({"bootstrap.servers": bootstrap_servers, "enable.idempotence": True,
-                         "acks": "all", "message.timeout.ms": 30000})
+        raise ValueError("La demora debe ser un número finito no negativo.")
+
+    # Requisito: tópico local con 3 particiones y factor de replicación 1.
+    admin = AdminClient({"bootstrap.servers": BROKER})
+    if TOPIC not in admin.list_topics(timeout=10).topics:
+        admin.create_topics([NewTopic(TOPIC, num_partitions=3, replication_factor=1)])[TOPIC].result()
+    topic = admin.list_topics(topic=TOPIC, timeout=10).topics[TOPIC]
+    if topic.error or len(topic.partitions) != 3 or any(len(p.replicas) != 1 for p in topic.partitions.values()):
+        raise RuntimeError("happiness-events debe tener 3 particiones y replicación 1.")
+
+    producer = Producer({"bootstrap.servers": BROKER})
     sent = 0
-    try:
-        for event in iter_events(data_path):
-            key = event["country"].encode("utf-8")
-            validate_event(event, key)
-            value = json.dumps(event, ensure_ascii=False, allow_nan=False, separators=(",", ":")).encode("utf-8")
-            delivery_errors = []
+    for event in iter_events(data_path):
+        errors = []
 
-            def delivered(error, message):
-                if error is not None:
-                    delivery_errors.append(str(error))
-                else:
-                    LOGGER.info("Enviado %s | %s | partición=%s offset=%s", event["event_id"],
-                                event["country"], message.partition(), message.offset())
+        def delivered(error, message):
+            if error:
+                errors.append(str(error))
 
-            producer.produce(TOPIC, key=key, value=value, on_delivery=delivered)
-            # Un registro confirmado antes del siguiente: simulación, no envío masivo.
-            remaining = producer.flush(35)
-            if remaining or delivery_errors:
-                raise RuntimeError(f"Entrega no confirmada: pendientes={remaining}, errores={delivery_errors}")
-            sent += 1
-            if limit is not None and sent >= limit:
-                break
-            if delay:
-                time.sleep(delay)
-    finally:
-        producer.flush(5)
-    LOGGER.info("Simulación terminada: %s eventos confirmados en %s", sent, TOPIC)
+        # Requisitos: serializar a JSON y enviar UN evento usando country como clave.
+        producer.produce(
+            TOPIC,
+            key=event["country"].encode("utf-8"),
+            value=json.dumps(event, ensure_ascii=False, allow_nan=False).encode("utf-8"),
+            on_delivery=delivered,
+        )
+        # Esperar confirmación del registro antes de continuar con el siguiente.
+        if producer.flush(30) or errors:
+            raise RuntimeError(f"No se pudo confirmar la entrega: {errors}")
+        sent += 1
+        print(f"Enviado {event['event_id']}: {event['country']} ({event['year']})")
+        time.sleep(delay)  # Requisito: simular llegada con una demora configurable.
     return sent
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--bootstrap-servers", default=BOOTSTRAP_SERVERS)
-    parser.add_argument("--data", type=Path, default=DATA_PATH)
-    parser.add_argument("--delay", type=float, default=0.1, help="Segundos entre registros (por defecto: 0.1).")
-    parser.add_argument("--limit", type=int, help="Límite opcional para una demostración corta.")
-    args = parser.parse_args()
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    try:
-        publish_events(args.bootstrap_servers, args.data, args.delay, args.limit)
-    except KeyboardInterrupt:
-        LOGGER.info("Productor detenido por el usuario.")
-
-
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--delay", type=float, default=0.1, help="Segundos entre registros.")
+    parser.add_argument("--data", type=Path, default=DATA_PATH, help="CSV histórico preparado.")
+    args = parser.parse_args()
+    publish_events(args.delay, args.data)
