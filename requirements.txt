@@ -9,3 +9,4 @@ matplotlib>=3.9,<4
 scipy>=1.14,<2
 confluent-kafka>=2.12,<3
 psycopg[binary]>=3.2,<4
+python-dotenv>=1,<2

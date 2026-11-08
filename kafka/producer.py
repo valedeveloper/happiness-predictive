@@ -4,6 +4,7 @@ import argparse
 import csv
 import json
 import math
+import os
 import time
 import uuid
 from datetime import datetime, timezone
@@ -11,11 +12,14 @@ from pathlib import Path
 
 from confluent_kafka import Producer
 from confluent_kafka.admin import AdminClient, NewTopic
+from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parents[1]
+load_dotenv(ROOT / ".env")
 DATA_PATH = ROOT / "data/processed/happiness_modeling.csv"
-BROKER = "127.0.0.1:9092"
-TOPIC = "happiness-events"  # Requisito: nombre obligatorio del tópico.
+BROKER = os.environ["KAFKA_BOOTSTRAP_SERVERS"]
+TOPIC = os.environ["KAFKA_TOPIC"]  # Requisito: happiness-events en .env.
+DELAY = float(os.environ["PRODUCER_DELAY_SECONDS"])
 
 
 def iter_events(data_path=DATA_PATH):
@@ -45,7 +49,7 @@ def iter_events(data_path=DATA_PATH):
             }
 
 
-def publish_events(delay=0.1, data_path=DATA_PATH):
+def publish_events(delay=DELAY, data_path=DATA_PATH):
     if not math.isfinite(delay) or delay < 0:
         raise ValueError("La demora debe ser un número finito no negativo.")
 
@@ -84,7 +88,7 @@ def publish_events(delay=0.1, data_path=DATA_PATH):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--delay", type=float, default=0.1, help="Segundos entre registros.")
+    parser.add_argument("--delay", type=float, default=DELAY, help="Segundos entre registros; predeterminado en .env.")
     parser.add_argument("--data", type=Path, default=DATA_PATH, help="CSV histórico preparado.")
     args = parser.parse_args()
     publish_events(args.delay, args.data)

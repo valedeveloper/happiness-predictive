@@ -13,13 +13,20 @@ from pathlib import Path
 import pandas as pd
 import psycopg
 from psycopg.rows import dict_row
+from psycopg import sql
+from psycopg.conninfo import make_conninfo
+from dotenv import load_dotenv
 from confluent_kafka import Consumer, KafkaException
 
 ROOT = Path(__file__).resolve().parents[1]
-BROKER = "127.0.0.1:9092"
-TOPIC = "happiness-events"
-GROUP = "happiness-ml-team"
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres@localhost:5432/happiness_dw")
+# Carga centralizada; las variables ya definidas en la terminal tienen prioridad.
+load_dotenv(ROOT / ".env")
+BROKER = os.environ["KAFKA_BOOTSTRAP_SERVERS"]
+TOPIC = os.environ["KAFKA_TOPIC"]
+GROUP = os.environ["KAFKA_CONSUMER_GROUP"]
+DATABASE_URL = os.getenv("DATABASE_URL") or make_conninfo(
+    host=os.environ["PGHOST"], port=os.environ["PGPORT"],
+    user=os.environ["PGUSER"], dbname=os.environ["PGDATABASE"])
 # Mismo orden de las seis columnas utilizado durante el entrenamiento.
 FEATURES = {
     "gdp": "gdp_per_capita", "family": "social_support",
@@ -103,6 +110,18 @@ def open_database(database_url=DATABASE_URL):
         db.close()
         raise
     return db
+
+
+def initialize_database(database_url=DATABASE_URL):
+    # CREATE DATABASE requiere una conexión administrativa fuera de una transacción.
+    from psycopg.conninfo import conninfo_to_dict
+    database = conninfo_to_dict(database_url)["dbname"]
+    with psycopg.connect(make_conninfo(database_url, dbname="postgres"), autocommit=True) as admin:
+        if not admin.execute("SELECT 1 FROM pg_database WHERE datname=%s", (database,)).fetchone():
+            admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database)))
+    # Reutiliza el DDL y la carga de países; no requiere Kafka ni cargar el modelo.
+    open_database(database_url).close()
+    print(f"Base {database} lista: tablas, vistas y catálogo de países creados.")
 
 
 def process_message(db, model, message, model_info):
@@ -224,4 +243,9 @@ def consume_events(database_url=DATABASE_URL):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--database-url", default=DATABASE_URL, help="Conexión PostgreSQL; también admite DATABASE_URL.")
-    consume_events(parser.parse_args().database_url)
+    parser.add_argument("--init-db", action="store_true", help="Crear la base, tablas y vistas; luego salir.")
+    args = parser.parse_args()
+    if args.init_db:
+        initialize_database(args.database_url)
+    else:
+        consume_events(args.database_url)

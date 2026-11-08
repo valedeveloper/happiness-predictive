@@ -173,10 +173,6 @@ La partición implementada es **cronológica**:
 | Desarrollo | 2015–2018 | 626 | 80,05 % | Ajustar hiperparámetros, comparar candidatos mediante validación y entrenar los modelos evaluados en 2019. |
 | Prueba final | 2019 | 156 | 19,95 % | Estimar desempeño temporal posterior a la selección. |
 
-La referencia inicial a 70/30 se sustituyó por esta partición temporal. Un corte aleatorio mezclaría ediciones; el diseño adoptado evalúa transferencia desde ediciones anteriores hacia una posterior. Un país puede estar en ambos subconjuntos: **el experimento no demuestra generalización a países nunca observados**.
-
-Los predictores corresponden a la edición evaluada. Se estima el puntaje cuando esos indicadores están disponibles; no se implementa un pronóstico anticipado basado exclusivamente en información del pasado.
-
 ### 6.3. Validación temporal expansiva
 
 Se usan tres ventanas dentro del desarrollo, sin entrenar con años posteriores al de validación:
@@ -202,27 +198,6 @@ En las expresiones, $x$ representa los seis predictores, $\hat{y}$ la predicció
 | Decision Tree Regressor | $\hat{y}=\sum_{m=1}^{M}c_m\mathbf{1}(x\in R_m)$ | Divide el espacio de entrada en regiones con predicción constante. Requiere controlar su complejidad para limitar sobreajuste. |
 | XGBoost | $F_t(x)=F_{t-1}(x)+\eta T_t(x)$ | Añade árboles secuencialmente para reducir una pérdida cuadrática con regularización; se usa `XGBRegressor`. |
 | LightGBM | $F_t(x)=F_{t-1}(x)+\eta T_t(x)$ | Boosting de árboles con histogramas y crecimiento por hojas; se usa `LGBMRegressor`. |
-
-
-### 7.1. Configuraciones evaluadas
-
-| Modelo | Parámetros explorados |
-| --- | --- |
-| Regresión Lineal | Configuración ordinaria con intercepto y escalado dentro del pipeline. |
-| Random Forest | 250 árboles; profundidad máxima 4 o sin límite; mínimo de observaciones por hoja 2 o 5. |
-| Decision Tree | Profundidad máxima 3, 5 u 8; mínimo de observaciones por hoja 5 o 10. |
-| XGBoost | 100 o 250 árboles; profundidad 2 o 3; tasa de aprendizaje 0,05; regularización L2 igual a 1; método `hist`. |
-| LightGBM | 100 o 250 árboles; máximo de hojas 7 o 15; tasa de aprendizaje 0,05; mínimo de 15 observaciones por hoja. |
-
-| Modelo | Configuraciones | Parámetros elegidos por validación |
-| --- | --- | --- |
-| Random Forest | 4 | `max_depth=None; min_samples_leaf=2` |
-| XGBoost | 4 | `max_depth=3; n_estimators=250` |
-| LightGBM | 4 | `n_estimators=100; num_leaves=15` |
-| Regresión Lineal | 1 | `Sin hiperparámetros de búsqueda` |
-| Decision Tree | 6 | `max_depth=8; min_samples_leaf=10` |
-
-Se evalúan **19 configuraciones**, cada una en tres ventanas. Los resultados completos se conservan en los archivos `*_grid_search.csv` de [data/reports/models](data/reports/models/).
 
 ## 8. Evaluación de modelos
 
@@ -365,25 +340,6 @@ El pipeline se guarda en [models/model.pkl](models/model.pkl). La preparación y
 
 **Las métricas de 2019 corresponden al ajuste 2015–2018, no al reentrenamiento con 2015–2019. El archivo final no dispone de un conjunto independiente adicional para evaluar ese último ajuste.** Verificar su carga y predicciones comprueba persistencia, no generalización.
 
-Ejemplo de inferencia desde la raíz del repositorio:
-
-```python
-import pickle
-import pandas as pd
-
-features = [
-    'gdp_per_capita', 'social_support', 'healthy_life_expectancy',
-    'freedom', 'generosity', 'corruption',
-]
-with open('models/model.pkl', 'rb') as file:
-    model = pickle.load(file)
-
-# Ejemplo de uso; no constituye evaluación independiente.
-examples = pd.read_csv('data/processed/happiness_modeling.csv')
-predictions = model.predict(examples[features].head())
-print(predictions)
-```
-
 ## 11. Parte B — Streaming ETL with Apache Kafka
 
 Esta etapa transforma el histórico preparado en un flujo simulado y ejecuta inferencia al recibir cada evento. La implementación se concentra en [producer.py](kafka/producer.py) y [consumer.py](kafka/consumer.py); Kafka transporta los mensajes y PostgreSQL conserva el original y el resultado.
@@ -478,7 +434,6 @@ El almacén en PostgreSQL organiza los resultados mediante una tabla raw/staging
 
 **Cada fila en `fact_predictions` corresponde a una predicción generada para un evento válido de un país y año histórico, con la versión del modelo utilizada.**
 
-`raw_event_id` vincula el hecho con su original y es único en la tabla de hechos. Una reentrega del mismo mensaje no produce otra fila; una nueva simulación tiene identificadores nuevos. Por tanto, país y año histórico no constituyen una clave única del hecho.
 
 ### 12.2. Modelo dimensional
 
@@ -555,7 +510,7 @@ La carga inicial fue contrastada con Kafka y con el modelo guardado; la evidenci
 
 ## 13. Dashboard and KPIs
 
-Esta sección queda preparada para incorporar las capturas del dashboard y su interpretación. Cada evidencia debe indicar año histórico o fecha operativa, versión del modelo y filtros utilizados.
+Las capturas documentan los resultados del dashboard en Power BI. R1 y R4 quedan pendientes de evidencia gráfica.
 
 | Panel | KPI que debe responder | Visualización prevista | Fuente |
 | --- | --- | --- | --- |
@@ -567,23 +522,29 @@ Esta sección queda preparada para incorporar las capturas del dashboard y su in
 
 ### 13.1. R1 — Calidad del flujo
 
-> **Espacio reservado:** capturas de conteos, distribución de estados, porcentaje con predicción y porcentaje de rechazo. Añadir interpretación y período consultado.
+> Captura pendiente: calidad del flujo, conteos y porcentajes por estado.
 
 ### 13.2. R2 — Comparación real–predicho
 
-> **Espacio reservado:** capturas de medias reales y predichas, diferencia media y dispersión. Añadir país o región, año histórico y versión seleccionada.
+![Comparación de felicidad real y predicha por país en Power BI](dashboards/screenshots/03_comparación_real_predicho.png)
+
+El mapa permite consultar la media real y predicha por país. La captura muestra a Liberia y sus métricas de error; el gráfico lateral compara el MAE entre países.
 
 ### 13.3. R3 — Precisión del modelo
 
-> **Espacio reservado:** capturas de MAE, RMSE y R². Indicar nivel de agregación y explicar cualquier R² nulo.
+![Indicadores de precisión del modelo en Power BI](dashboards/screenshots/02_precision_modelo.png)
+
+La captura registra 782 predicciones, MAE de 0,17, RMSE de 0,22 y R² de 0,96. Son métricas del histórico reutilizado en la simulación con el modelo final reentrenado; no sustituyen los resultados de prueba de la Parte A.
 
 ### 13.4. R4 — Actividad y demora del streaming
 
-> **Espacio reservado:** capturas del volumen diario y demora media de emisión a predicción. Identificar si se incluyen mensajes recuperados del histórico.
+> Captura pendiente: predicciones por día de emisión y demora media emisión–predicción.
 
 ### 13.5. R5 — Países con mayores errores
 
-> **Espacio reservado:** capturas del ranking por MAE, máximo error absoluto y porcentaje superior a 0,5 puntos. Añadir año histórico y versión.
+![Países con mayor error absoluto medio en Power BI](dashboards/screenshots/05_países_mayores_errores.png)
+
+El ranking ordena los países por MAE descendente. Hong Kong presenta el mayor valor entre los países visibles, seguido de Sri Lanka y Botswana. Esta captura documenta el ranking por MAE; el máximo error absoluto y el porcentaje de errores superiores a 0,5 puntos no se muestran.
 
 ### 13.6. Criterios de interpretación de los KPI
 
@@ -617,6 +578,7 @@ workshop-3/
 ├── README.md                         # Metodología, resultados y ejecución
 ├── docker-compose.yml                # Kafka; PostgreSQL Docker opcional
 ├── requirements.txt                  # Dependencias Python
+├── .env                              # Configuración local; excluida de Git
 ├── data/
 │   ├── raw/                          # CSV originales 2015–2019
 │   ├── processed/                    # Datasets preparados y metadatos
@@ -641,142 +603,125 @@ workshop-3/
 │   └── streaming.sql                 # Staging, dimensiones, hecho y vistas
 ├── dashboards/
 │   ├── diagrams/                     # Arquitectura y flujo de entrenamiento
-│   └── screenshots/                  # Figuras EDA/modelos; futuras capturas KPI
+│   └── screenshots/                  # Figuras EDA/modelos y capturas Power BI
 └── tests/
     └── test_streaming.py              # Contrato, persistencia y KPI PostgreSQL
 ```
 
 ## 16. Execution instructions
 
-### 16.1. Preparar el entorno Python
+Ejecutar desde la raíz del proyecto en **Git Bash (Windows)**. Tener instalados Python, Docker Desktop y PostgreSQL; iniciar Docker Desktop y el servicio PostgreSQL local.
 
-Desde la raíz del repositorio, crear el entorno si aún no existe e instalar las dependencias. Los comandos siguientes utilizan **PowerShell 7**:
+### 16.1. Instalar dependencias
 
-```powershell
+```bash
 python -m venv .venv
-.venv\Scripts\python.exe -m pip install -r requirements.txt
+./.venv/Scripts/python.exe -m pip install -r requirements.txt
 ```
 
-Seleccionar ese intérprete como kernel de los notebooks. El artefacto serializado debe utilizarse con versiones compatibles con las registradas en [model_metadata.json](models/model_metadata.json).
+### 16.2. Configurar el entorno
 
-### 16.2. Preparar PostgreSQL local
+Crear o completar `.env` en la raíz con estos valores y sustituir la contraseña:
 
-La conexión principal utiliza estos parámetros:
-
-| Parámetro | Valor |
-| --- | --- |
-| Host | `localhost` |
-| Puerto | `5432` |
-| Usuario | `postgres` |
-| Base del proyecto | `happiness_dw` |
-| Contraseña | La contraseña configurada en tu instalación local; no se incluye en el repositorio. |
-
-Iniciar el servicio PostgreSQL y, **solo si la base todavía no existe**, crearla desde pgAdmin o `psql`, conectado a la base administrativa `postgres`:
-
-```sql
-CREATE DATABASE happiness_dw OWNER postgres;
+```dotenv
+PGHOST=''
+PGPORT=''
+PGUSER=''
+PGPASSWORD='TU_CONTRASEÑA'
+PGDATABASE=happiness_dw
+PGCONNECT_TIMEOUT=5
+KAFKA_BOOTSTRAP_SERVERS=127.0.0.1:9092
+KAFKA_EXTERNAL_HOST=127.0.0.1
+KAFKA_PORT=9092
+KAFKA_TOPIC=happiness-events
+KAFKA_CONSUMER_GROUP=happiness-ml-team
+PRODUCER_DELAY_SECONDS=0.1
 ```
 
-El consumidor crea automáticamente tablas y vistas dentro de `happiness_dw` y carga el catálogo de países al iniciar. No crea el servidor ni la base administrativa. Para proporcionar la contraseña en la terminal que ejecutará el consumidor:
 
-```powershell
-$env:PGPASSWORD = Read-Host 'Contraseña de postgres' -MaskInput
+### 16.3. Ejecutar los notebooks
+
+En VS Code, seleccionar `.venv` como kernel y ejecutar las celdas en este orden:
+
+1. `notebooks/data-profiling.ipynb`
+2. `notebooks/transform-data.ipynb`
+3. `notebooks/exploratory-data-analysis.ipynb`
+4. `notebooks/models-happiness.ipynb`
+
+Si ya están disponibles los CSV preparados y `models/model.pkl`, continuar con el siguiente paso.
+
+### 16.4. Crear la base de datos
+
+```bash
+./.venv/Scripts/python.exe kafka/consumer.py --init-db
 ```
 
-La conexión predeterminada es `postgresql://postgres@localhost:5432/happiness_dw`. `DATABASE_URL` o `--database-url` permiten seleccionar otra base o usuario; las variables estándar de PostgreSQL, como `PGPASSWORD`, proporcionan la autenticación. Si la URI contiene una contraseña, sus caracteres reservados deben codificarse para una URL.
+En pgAdmin, actualizar **Databases → happiness_dw → Schemas → public → Tables**.
 
-El servicio PostgreSQL de Docker queda bajo el perfil opcional `database`; **`docker compose up -d` inicia el flujo Kafka y utiliza tu PostgreSQL local para el consumidor**. No es necesario activar ese perfil cuando la instalación local ya utiliza el puerto 5432. El volumen anterior de demostración se conserva; cambiar la configuración de conexión no copia automáticamente sus datos a la instalación local.
+### 16.5. Iniciar Kafka
 
-### 16.3. Reproducir la Parte A
-
-Ejecutar las celdas en orden dentro de cada notebook:
-
-| Orden | Notebook | Producto principal |
-| --- | --- | --- |
-| 1 | [data-profiling.ipynb](notebooks/data-profiling.ipynb) | Diagnóstico e informes de los originales. La generación HTML es opcional y configurable. |
-| 2 | [transform-data.ipynb](notebooks/transform-data.ipynb) | CSV analítico, CSV de modelado y metadatos de transformación. |
-| 3 | [exploratory-data-analysis.ipynb](notebooks/exploratory-data-analysis.ipynb) | Figuras y tablas de distribuciones, regiones, evolución y asociaciones. |
-| 4 | [models-happiness.ipynb](notebooks/models-happiness.ipynb) | Comparación de modelos, diagnósticos, `model.pkl` y metadatos. |
-
-Los notebooks localizan la raíz a partir de sus archivos de entrada. Las tablas se exportan a `data/reports/eda/` y `data/reports/models/`; las figuras, a `dashboards/screenshots/eda/` y `dashboards/screenshots/models/`.
-
-### 16.4. Ejecutar las partes B y C
-
-Con Docker Desktop activo, iniciar Kafka y comprobar el tópico:
-
-```powershell
+```bash
 docker compose up -d
 docker compose ps -a
 docker compose logs kafka-init
 ```
 
-El broker debe estar `healthy`; los inicializadores deben terminar con código 0. `kafka-init` debe mostrar `happiness-events` con tres particiones y replicación uno.
+Comprobar que Kafka esté `healthy` y que `happiness-events` tenga **3 particiones y replicación 1**. No activar el perfil Docker `database`: se utiliza PostgreSQL local.
 
-**Terminal 1 — consumidor**, con PostgreSQL y `happiness_dw` disponibles:
+### 16.6. Ejecutar el streaming
 
-```powershell
-$env:PGPASSWORD = Read-Host 'Contraseña de postgres' -MaskInput
-.venv\Scripts\python.exe kafka/consumer.py
+**Terminal 1 — consumidor**, desde la raíz:
+
+```bash
+./.venv/Scripts/python.exe kafka/consumer.py
 ```
 
-**Terminal 2 — productor**:
+**Terminal 2 — productor**, desde la raíz:
 
-```powershell
-.venv\Scripts\python.exe kafka/producer.py --delay 0.1
+```bash
+./.venv/Scripts/python.exe kafka/producer.py --delay 0.1
 ```
 
-Se publican los 782 registros del histórico preparado. `--delay` modifica los segundos entre publicaciones; `--data` permite señalar otro CSV con el mismo esquema. El consumidor espera continuamente y se detiene con `Ctrl+C`.
+Esperar a que el productor termine de publicar el histórico.
 
-El grupo retoma sus offsets confirmados. Cambiar de base no hace que Kafka reenvíe automáticamente eventos ya confirmados: una nueva publicación crea una simulación nueva; la recuperación deliberada de eventos anteriores requiere un procedimiento de replay y validación de offsets.
+### 16.7. Comprobar la carga
 
-### 16.5. Consultar resultados y ejecutar pruebas
-
-Desde pgAdmin o `psql` conectado a **`happiness_dw`**:
+En pgAdmin, abrir **Query Tool** sobre `happiness_dw` y ejecutar:
 
 ```sql
--- Calidad del flujo y causas de rechazo.
+SELECT processing_status, COUNT(*)
+FROM raw_happiness_events
+GROUP BY processing_status;
+
+SELECT COUNT(*) AS total_predictions FROM fact_predictions;
+
 SELECT * FROM v_event_quality_daily ORDER BY received_date;
-
--- Trazabilidad de las últimas predicciones.
-SELECT event_id, country_name, observation_year, calendar_date,
-       actual_score, predicted_score, prediction_error
-FROM v_prediction_detail
-ORDER BY prediction_id DESC LIMIT 10;
-
--- Métricas regionales: no mezclar este nivel con países o totales.
-SELECT region, observation_year, mae, rmse, r2
-FROM v_prediction_metrics
-WHERE country_name IS NULL AND region IS NOT NULL
-ORDER BY observation_year, region;
+SELECT * FROM v_prediction_activity_daily ORDER BY calendar_date;
 ```
 
-Para usar el cliente instalado con PostgreSQL 18, si `psql` no está en el PATH:
+### 16.8. Conectar Power BI
 
-```powershell
-& 'C:\Program Files\PostgreSQL\18\bin\psql.exe' -h localhost -p 5432 -U postgres -d happiness_dw
+1. Seleccionar **Obtener datos → PostgreSQL**.
+2. Indicar servidor `localhost:5432`, base `happiness_dw` y modo **Importar**.
+3. Autenticarse con `postgres` y la contraseña local.
+4. Cargar `fact_predictions`, `dim_country`, `dim_date` y `raw_happiness_events`.
+5. Cargar `v_event_quality_daily` y `v_prediction_activity_daily` para R1 y R4.
+6. Configurar las relaciones según el diagrama dimensional; mantener las dos vistas diarias sin relaciones automáticas.
+7. Pulsar **Actualizar** después de procesar nuevos eventos.
+
+### 16.9. Ejecutar pruebas de PostgreSQL
+
+```bash
+RUN_POSTGRES_TESTS=1 ./.venv/Scripts/python.exe -m unittest discover -s tests -v
 ```
 
-Las pruebas requieren autenticación configurada y utilizan un esquema temporal aislado, que se elimina al terminar. No vacían las tablas del almacén:
+### 16.10. Detener el flujo
 
-```powershell
-$env:PGPASSWORD = Read-Host 'Contraseña de postgres' -MaskInput
-$env:RUN_POSTGRES_TESTS = '1'
-.venv\Scripts\python.exe -m unittest discover -s tests -v
-Remove-Item Env:RUN_POSTGRES_TESTS
-```
+En la terminal del consumidor, pulsar `Ctrl+C`. Después ejecutar:
 
-La [evidencia de verificación](data/reports/streaming/verification.json) describe la ejecución comprobada en el entorno anterior de demostración. No certifica por sí sola la conexión ni la carga de tu instalación local: eso se comprueba ejecutando los comandos anteriores con tus credenciales.
-
-### 16.6. Detener el flujo
-
-Detener los procesos Python con `Ctrl+C` y después ejecutar:
-
-```powershell
+```bash
 docker compose down
-Remove-Item Env:PGPASSWORD -ErrorAction SilentlyContinue
 ```
-
-El volumen Kafka y los datos de PostgreSQL se conservan. El servicio PostgreSQL instalado localmente se administra de forma independiente de Docker Compose.
 
 ## 17. Fuentes y documentación técnica
 

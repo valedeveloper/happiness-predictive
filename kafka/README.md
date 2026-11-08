@@ -65,17 +65,17 @@ La base es **`happiness_dw` en PostgreSQL**, accesible en `localhost:5432`. El s
 
 ## Ejecución desde la raíz del proyecto
 
-Con Docker Desktop iniciado, PostgreSQL local activo y la base `happiness_dw` creada según las [instrucciones principales](../README.md#16-execution-instructions):
+Con Docker Desktop iniciado, PostgreSQL local activo y el `.env` completado según las [instrucciones principales](../README.md#16-execution-instructions):
 
 ```powershell
 .venv\Scripts\python.exe -m pip install -r requirements.txt
+.venv\Scripts\python.exe kafka/consumer.py --init-db
 docker compose up -d
 ```
 
 Terminal 1 — consumidor:
 
 ```powershell
-$env:PGPASSWORD = Read-Host 'Contraseña de postgres' -MaskInput
 .venv\Scripts\python.exe kafka/consumer.py
 ```
 
@@ -87,7 +87,7 @@ Terminal 2 — productor:
 
 `--data` permite señalar otro CSV preparado. El consumidor admite `--database-url` o la variable de entorno `DATABASE_URL` para indicar la conexión PostgreSQL. Ambos programas también pueden ejecutarse como módulos con `python -m kafka.producer` y `python -m kafka.consumer`. Detener los procesos Python con `Ctrl+C` y el entorno con `docker compose down`, que conserva el volumen Kafka. El servidor PostgreSQL local se administra independientemente de Docker.
 
-La conexión principal utiliza el usuario `postgres` y la base `happiness_dw`. La contraseña se proporciona localmente mediante `PGPASSWORD`:
+La conexión principal utiliza el usuario `postgres` y la base `happiness_dw`. La contraseña se configura en `PGPASSWORD` dentro del `.env` de la raíz. Este archivo también centraliza host, puerto, base, usuario, broker, tópico, grupo e intervalo del productor. Se carga automáticamente y no se versiona. `--init-db` crea la base si falta y ejecuta `sql/streaming.sql` para preparar tablas y vistas, sin iniciar el consumidor:
 
 ```text
 postgresql://postgres@localhost:5432/happiness_dw
@@ -114,7 +114,6 @@ ORDER BY prediction_id DESC LIMIT 10;
 Las pruebas se concentran en un archivo y utilizan un esquema temporal aislado en PostgreSQL. Con el servicio activo:
 
 ```powershell
-$env:PGPASSWORD = Read-Host 'Contraseña de postgres' -MaskInput
 $env:RUN_POSTGRES_TESTS = '1'
 .venv\Scripts\python.exe -m unittest discover -s tests -v
 Remove-Item Env:RUN_POSTGRES_TESTS
