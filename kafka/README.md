@@ -65,7 +65,7 @@ La base es **`happiness_dw` en PostgreSQL**, accesible en `localhost:5432`. El s
 
 ## Ejecución desde la raíz del proyecto
 
-Con Docker Desktop iniciado, PostgreSQL local activo y el `.env` completado según las [instrucciones principales](../README.md#16-execution-instructions):
+Con Docker Desktop iniciado, PostgreSQL local activo y el `.env` completado según las [instrucciones principales](../README.md#16-instrucciones-de-ejecución):
 
 ```powershell
 .venv\Scripts\python.exe -m pip install -r requirements.txt
